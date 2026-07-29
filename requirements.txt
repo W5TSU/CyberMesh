@@ -1,0 +1,4 @@
+flask
+meshtastic
+python-dotenv
+waitress

@@ -1,0 +1,19 @@
+[Unit]
+Description=CyberMesh — Meshtastic node web control
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/path/to/CyberMesh
+EnvironmentFile=/path/to/CyberMesh/.env
+ExecStart=/path/to/CyberMesh/venv/bin/python3 /path/to/CyberMesh/app.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cybermesh
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,1056 @@
+{% extends "base.html" %}
+{% block title %} — Dashboard{% endblock %}
+{% block head %}
+<link rel="stylesheet" href="/static/leaflet/leaflet.css" />
+<script src="/static/leaflet/leaflet.js"></script>
+<style>
+  #map { height: 420px; border-radius: 10px; }
+  .leaflet-popup-content-wrapper, .leaflet-popup-tip { background: var(--panel); color: var(--text); }
+  .leaflet-container { background: #0b0f14; }
+  .leaflet-popup-content { margin: 0.7rem 0.9rem; }
+  /* Node marker: the station's short name — which on Meshtastic is very often
+     an emoji — rendered like an APRS symbol rather than an anonymous dot. */
+  .node-marker {
+    display: flex; align-items: center; justify-content: center;
+    width: 30px; height: 30px; border-radius: 50%;
+    background: #0b0f14; border: 2px solid var(--accent2);
+    font-size: 14px; line-height: 1; white-space: nowrap; overflow: hidden;
+    box-shadow: 0 0 8px rgba(255,51,136,0.65);
+  }
+  .node-marker.self { border-color: var(--accent); box-shadow: 0 0 10px rgba(51,224,255,0.8); }
+  .node-marker.mqtt { border-color: var(--warn); box-shadow: 0 0 8px rgba(255,204,51,0.6); }
+  .node-marker.txt { font-size: 10px; font-weight: 700; letter-spacing: -0.02em; }
+  .legend { display: flex; gap: 1.2rem; flex-wrap: wrap; margin-top: 0.7rem; font-size: 0.8rem; }
+  .legend span::before {
+    content: ""; display: inline-block; width: 10px; height: 10px;
+    border-radius: 50%; margin-right: 0.4rem; vertical-align: middle;
+  }
+  .legend .l-self::before { background: var(--accent); }
+  .legend .l-rf::before { background: var(--accent2); }
+  .legend .l-mqtt::before { background: var(--warn); }
+  .src { font-size: 0.7rem; font-weight: 700; letter-spacing: 0.04em; }
+  .src.rf { color: var(--accent2); }
+  .src.mqtt { color: var(--warn); }
+  #node-table th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+  #node-table th.sortable:hover { color: var(--accent); }
+  #node-table th.sortable::after { content: "\2195"; opacity: 0.3; margin-left: 0.3rem; font-size: 0.8em; }
+  #node-table th.sortable.asc::after { content: "\2191"; opacity: 1; color: var(--accent); }
+  #node-table th.sortable.desc::after { content: "\2193"; opacity: 1; color: var(--accent); }
+  #node-table tbody tr { cursor: pointer; }
+  #node-table tbody tr:hover { background: rgba(51,224,255,0.06); }
+  .sym { font-size: 1.05rem; }
+  button.mini { padding: 0.2rem 0.5rem; font-size: 0.76rem; }
+  .st-failed { color: var(--accent2); font-weight: 600; }
+  /* DM composer */
+  #dm-backdrop {
+    display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+    z-index: 1000; align-items: center; justify-content: center; padding: 1rem;
+  }
+  #dm-backdrop.open { display: flex; }
+  #dm-box {
+    background: var(--panel); border: 1px solid var(--accent);
+    border-radius: 10px; padding: 1.1rem 1.2rem; width: min(460px, 100%);
+  }
+  #dm-box h3 { margin: 0 0 0.2rem; font-size: 1rem; color: var(--accent); }
+  #dm-text { width: 100%; min-height: 90px; margin: 0.7rem 0 0.5rem; }
+  /* Favorites / notes */
+  .star-btn {
+    background: none; border: none; padding: 0 0.2rem; font-size: 1.05rem;
+    line-height: 1; cursor: pointer; color: var(--muted);
+  }
+  .star-btn.fav { color: var(--warn); }
+  .star-btn:hover { background: none; }
+  tr.fav-row { background: rgba(255,204,51,0.05); }
+  tr.fav-row:hover { background: rgba(255,204,51,0.1); }
+  .path-badge {
+    display: inline-block; font-size: 0.72rem; font-weight: 600;
+    color: var(--ok); border: 1px solid var(--ok); border-radius: 999px;
+    padding: 0.05rem 0.4rem; margin-left: 0.35rem;
+  }
+  #notes-box { width: min(520px, 100%); }
+  #notes-text { width: 100%; min-height: 80px; margin: 0.5rem 0; }
+  #notes-saved-list { max-height: 220px; overflow-y: auto; margin-top: 0.4rem; }
+  .saved-trace {
+    padding: 0.4rem 0; border-bottom: 1px solid var(--border); font-size: 0.82rem;
+  }
+  .saved-trace:last-child { border-bottom: none; }
+
+  /* Channel Health chart — hand-rolled SVG, no charting library, matching
+     the vendored-not-CDN pattern already used for Leaflet. Series colors are
+     the dataviz skill's pre-validated dark-mode categorical slots 1/2 (blue,
+     orange) rather than this app's own accent/accent2 — picked because they
+     came with a documented CVD-safe guarantee for this exact pairing, which
+     nothing in this app's ad-hoc palette has been checked against. */
+  .range-btn.active { border-color: var(--accent); color: var(--accent); background: rgba(51,224,255,0.1); }
+  #health-chart-wrap { position: relative; }
+  #health-chart { width: 100%; height: 220px; display: block; overflow: visible; }
+  .health-gridline { stroke: #2c2c2a; stroke-width: 1; }
+  .health-axis-label { fill: var(--muted); font-size: 10px; }
+  .health-line-cu { fill: none; stroke: #3987e5; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+  .health-line-ack { fill: none; stroke: #d95926; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+  .health-dot-cu { fill: #3987e5; stroke: #0b0f14; stroke-width: 2; }
+  .health-dot-ack { fill: #d95926; stroke: #0b0f14; stroke-width: 2; }
+  .health-endlabel { font-size: 11px; font-weight: 600; }
+  .health-endlabel-cu { fill: #3987e5; }
+  .health-endlabel-ack { fill: #d95926; }
+  .health-crosshair { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3,3; pointer-events: none; }
+  #health-tooltip {
+    position: absolute; display: none; pointer-events: none; z-index: 5;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+    padding: 0.4rem 0.6rem; font-size: 0.78rem; white-space: nowrap;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+  }
+  #health-tooltip .tt-row { display: flex; align-items: center; gap: 0.4rem; }
+  #health-tooltip .tt-key { display: inline-block; width: 12px; height: 2px; }
+  #health-tooltip .tt-val { font-weight: 700; color: var(--text); margin-left: auto; padding-left: 0.6rem; }
+  #health-tooltip .tt-time { color: var(--muted); font-size: 0.72rem; margin-bottom: 0.2rem; }
+  .health-legend { display: flex; gap: 1.4rem; flex-wrap: wrap; margin-top: 0.5rem; font-size: 0.8rem; align-items: center; }
+  .health-legend .key { display: inline-block; width: 16px; height: 2px; margin-right: 0.4rem; vertical-align: middle; }
+  .health-legend .key.cu { background: #3987e5; }
+  .health-legend .key.ack { background: #d95926; }
+  #health-table-wrap { max-height: 280px; overflow-y: auto; margin-top: 0.6rem; }
+
+  /* Hero stat — the one number this dashboard leads with. Colored by
+     severity like the app's existing status text (.st-delivered/.st-failed
+     already do this with the same tokens), paired with a text qualifier
+     rather than color alone. */
+  .stat-hero { display: flex; align-items: baseline; gap: 0.9rem; flex-wrap: wrap; }
+  .stat-hero .stat-label { font-size: 0.8rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+  .stat-hero .stat-value { font-size: 3rem; font-weight: 700; line-height: 1; }
+  .stat-hero .stat-value.ok { color: var(--ok); }
+  .stat-hero .stat-value.warn { color: var(--warn); }
+  .stat-hero .stat-value.danger { color: var(--accent2); }
+  .stat-hero .stat-qualifier { font-size: 0.95rem; font-weight: 600; }
+  .stat-hero .stat-qualifier.ok { color: var(--ok); }
+  .stat-hero .stat-qualifier.warn { color: var(--warn); }
+  .stat-hero .stat-qualifier.danger { color: var(--accent2); }
+  .stat-hero .stat-sub { color: var(--muted); font-size: 0.8rem; margin-left: auto; }
+</style>
+{% endblock %}
+{% block content %}
+<div class="panel">
+  <div class="stat-hero">
+    <div>
+      <div class="stat-label">Channel utilization</div>
+      <span class="stat-value" id="cu-hero-value">—</span>
+      <span class="stat-qualifier" id="cu-hero-qualifier"></span>
+    </div>
+    <span class="stat-sub" id="cu-hero-sub"></span>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Map</h2>
+  <div id="map"></div>
+  <div class="legend">
+    <span class="l-self">This node</span>
+    <span class="l-rf">Heard over RF</span>
+    <span class="l-mqtt">Via MQTT</span>
+    <span class="muted" style="margin-left:auto;">Marker shows the station&#39;s short name / emoji. Click a marker for actions.</span>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Nodes in mesh <span id="node-counts" class="muted" style="text-transform:none;letter-spacing:0;"></span></h2>
+  <div class="row" style="margin-bottom:0.6rem;">
+    <input type="text" id="node-search" placeholder="Search name / short name / ID…" style="min-width:200px;">
+    <label class="muted" for="dist-filter">Within</label>
+    <select id="dist-filter">
+      <option value="">any distance</option>
+      <option value="10">10 mi</option>
+      <option value="25">25 mi</option>
+      <option value="50">50 mi</option>
+      <option value="100">100 mi</option>
+      <option value="250">250 mi</option>
+      <option value="500">500 mi</option>
+    </select>
+    <label class="muted"><input type="checkbox" id="show-nopos" checked style="vertical-align:middle;"> include nodes with no position</label>
+    <label class="muted"><input type="checkbox" id="fav-only" style="vertical-align:middle;"> favorites only</label>
+    <label class="muted" for="heard-filter">Heard within</label>
+    <select id="heard-filter">
+      <option value="">any time</option>
+      <option value="900">15 min</option>
+      <option value="3600">1 hour</option>
+      <option value="21600">6 hours</option>
+      <option value="86400">24 hours</option>
+      <option value="604800">7 days</option>
+    </select>
+    <span class="muted" id="origin-note" style="margin-left:auto;"></span>
+  </div>
+  <table id="node-table">
+    <thead>
+      <tr>
+        <th class="sortable" data-sort="fav">★</th>
+        <th></th>
+        <th class="sortable" data-sort="name">Name</th>
+        <th>ID</th>
+        <th>Src</th>
+        <th class="sortable" data-sort="dist">Dist</th>
+        <th class="sortable" data-sort="battery">Battery</th>
+        <th class="sortable" data-sort="snr">SNR</th>
+        <th class="sortable" data-sort="heard">Last heard</th>
+        <th>Position</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody><tr><td colspan="11" class="muted">Loading…</td></tr></tbody>
+  </table>
+  <p class="muted" style="margin-bottom:0;">Click a row to centre the map on that station. Use the buttons to message it, trace the route to it, or star/annotate it. Nodes with a saved traceroute show a <span class="path-badge">path</span> badge — a proven route you've recorded.</p>
+</div>
+
+<div class="panel">
+  <h2>Channel Health</h2>
+  <div class="row" style="margin-bottom:0.4rem;">
+    <span class="muted">Range</span>
+    <button class="mini range-btn" data-range="3600">1h</button>
+    <button class="mini range-btn" data-range="21600">6h</button>
+    <button class="mini range-btn active" data-range="86400">24h</button>
+    <button class="mini range-btn" data-range="604800">7d</button>
+    <button class="mini range-btn" data-range="0">All</button>
+    <button class="mini" style="margin-left:auto;" onclick="toggleHealthTable()">Table view</button>
+  </div>
+  <div id="health-chart-wrap">
+    <svg id="health-chart" viewBox="0 0 800 220" preserveAspectRatio="none"></svg>
+    <div id="health-tooltip"></div>
+  </div>
+  <div class="health-legend">
+    <span><span class="key cu"></span>Channel utilization</span>
+    <span><span class="key ack"></span>Ack success rate</span>
+  </div>
+  <p class="muted" id="health-empty" style="display:none;margin-bottom:0;">Collecting telemetry — the node broadcasts its own channel utilization every ~15–30 min, so this fills in over time.</p>
+  <div id="health-table-wrap" style="display:none;">
+    <table id="health-table">
+      <thead><tr><th>Time</th><th>Channel util</th><th>Ack success</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Traceroutes</h2>
+  <div id="traceroutes" class="muted">None yet — trace a node from the map or the list above.</div>
+</div>
+
+<div id="notes-backdrop" class="dm-backdrop-like" onclick="if(event.target===this) closeNotes()" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:1000; align-items:center; justify-content:center; padding:1rem;">
+  <div id="notes-box" class="panel" style="margin-bottom:0;">
+    <h3 id="notes-title" style="margin:0 0 0.2rem; font-size:1rem; color:var(--accent);">Node notes</h3>
+    <div class="muted" id="notes-sub"></div>
+    <label class="row" style="margin-top:0.6rem;">
+      <input type="checkbox" id="notes-fav"> <span>Favorite (proven / trusted node)</span>
+    </label>
+    <textarea id="notes-text" maxlength="1000" placeholder="Notes — e.g. antenna, path, reliability…"></textarea>
+    <div class="row">
+      <button style="margin-left:auto;" onclick="closeNotes()">Cancel</button>
+      <button onclick="saveNotes()">Save</button>
+    </div>
+    <div class="muted" style="margin-top:0.8rem; font-size:0.8rem; text-transform:uppercase; letter-spacing:0.05em;">Saved traceroutes</div>
+    <div class="row" style="margin-top:0.3rem;">
+      <button class="mini" onclick="saveCurrentTraceroute()">Save latest traceroute to this node</button>
+    </div>
+    <div id="notes-saved-list" class="muted">None saved yet.</div>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Admin</h2>
+  <div class="row">
+    <button onclick="adminAction('reboot')">Reboot node</button>
+    <button class="danger" onclick="adminAction('shutdown')">Shutdown node</button>
+    <button class="danger" onclick="adminAction('factory_reset')">Factory reset</button>
+  </div>
+  <p class="muted">These act on the node directly — same as the option in the phone app.</p>
+</div>
+
+<div id="dm-backdrop" onclick="if(event.target===this) closeDM()">
+  <div id="dm-box">
+    <h3 id="dm-title">Direct message</h3>
+    <div class="muted" id="dm-sub"></div>
+    <textarea id="dm-text" maxlength="200" placeholder="Message…"></textarea>
+    <div class="row">
+      <span class="muted" id="dm-count">0/200</span>
+      <button style="margin-left:auto;" onclick="closeDM()">Cancel</button>
+      <button onclick="sendDM()">Send</button>
+    </div>
+  </div>
+</div>
+{% endblock %}
+{% block script %}
+function esc(s) {
+  return (s ?? '').toString().replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function fmtAgo(unixSecs) {
+  if (!unixSecs) return '—';
+  const s = Math.floor(Date.now()/1000) - unixSecs;
+  if (s < 60) return s + 's ago';
+  if (s < 3600) return Math.floor(s/60) + 'm ago';
+  if (s < 86400) return Math.floor(s/3600) + 'h ago';
+  return Math.floor(s/86400) + 'd ago';
+}
+// A short name is "a symbol" if it is a single glyph that isn't plain ASCII —
+// that's how Meshtastic ops actually mark their stations, the same role an
+// APRS symbol plays.
+function isSymbol(shortName) {
+  if (!shortName) return false;
+  return [...shortName].length <= 2 && /[^\x00-\x7F]/.test(shortName);
+}
+
+let map = null;
+const markers = {};
+let LAST_NODES = [];
+let NODE_META = {};       // node_id -> {favorite, notes, updated_ts}
+let SAVED_TRACE_COUNTS = {}; // node_id -> count of saved traceroutes
+
+async function refreshNodeMeta() {
+  try {
+    const r = await fetch('/api/nodes/meta');
+    if (r.ok) NODE_META = await r.json();
+  } catch (e) {}
+  try {
+    const r2 = await fetch('/api/traceroute/saved');
+    if (r2.ok) {
+      const list = await r2.json();
+      SAVED_TRACE_COUNTS = {};
+      list.forEach(t => { SAVED_TRACE_COUNTS[t.node_id] = (SAVED_TRACE_COUNTS[t.node_id] || 0) + 1; });
+    }
+  } catch (e) {}
+}
+
+function milesBetween(a, b) {
+  const R = 3958.8, rad = d => d * Math.PI / 180;
+  const dLat = rad(b[0] - a[0]), dLon = rad(b[1] - a[1]);
+  const h = Math.sin(dLat/2)**2 +
+            Math.cos(rad(a[0])) * Math.cos(rad(b[0])) * Math.sin(dLon/2)**2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+// Distance is measured from the node's own GPS fix when it has one, and from
+// the configured HOME_LAT/HOME_LON otherwise (see .env).
+function nodeMiles(n) {
+  const o = window.ORIGIN, p = n.position || {};
+  if (!o || !p.latitude || !p.longitude) return null;
+  return milesBetween([o.lat, o.lon], [p.latitude, p.longitude]);
+}
+function isFavorite(n) {
+  const u = n.user || {};
+  return !!(u.id && NODE_META[u.id] && NODE_META[u.id].favorite);
+}
+function passesSearch(n) {
+  const q = document.getElementById('node-search').value.trim().toLowerCase();
+  if (!q) return true;
+  const u = n.user || {};
+  return (u.longName || '').toLowerCase().includes(q) ||
+         (u.shortName || '').toLowerCase().includes(q) ||
+         (u.id || '').toLowerCase().includes(q);
+}
+function passesFilter(n) {
+  if (!passesSearch(n)) return false;
+  if (document.getElementById('fav-only').checked && !isFavorite(n)) return false;
+  const heardMax = parseFloat(document.getElementById('heard-filter').value);
+  if (!isNaN(heardMax)) {
+    const age = n.lastHeard ? (Date.now() / 1000 - n.lastHeard) : null;
+    if (age === null || age > heardMax) return false;
+  }
+  const limit = parseFloat(document.getElementById('dist-filter').value);
+  const d = nodeMiles(n);
+  if (d === null) {
+    // No position: can't be distance-checked, so it's governed by its own
+    // toggle rather than silently vanishing when a filter is applied.
+    return document.getElementById('show-nopos').checked;
+  }
+  return isNaN(limit) ? true : d <= limit;
+}
+
+function initMap() {
+  // Placeholder view only — refreshNodes() re-fits to real node positions
+  // within a second or two of load, so this is rarely seen for long.
+  map = L.map('map', {attributionControl: false}).setView([20, 0], 2);
+  // Leaflet itself is served locally so the map code always loads; the tiles
+  // still need internet, but losing them degrades to markers on a dark
+  // background instead of a blank page.
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+    maxZoom: 19,
+    attribution: '&copy; OpenStreetMap &copy; CARTO'
+  }).addTo(map);
+}
+
+function nodeIcon(n, isSelf) {
+  const short = (n.user || {}).shortName || '';
+  const cls = isSelf ? 'self' : (n.viaMqtt ? 'mqtt' : '');
+  const textCls = isSymbol(short) ? '' : ' txt';
+  const label = short ? esc(short.slice(0, 4)) : '?';
+  return L.divIcon({
+    className: '',
+    html: `<div class="node-marker ${cls}${textCls}">${label}</div>`,
+    iconSize: [30, 30],
+    iconAnchor: [15, 15],
+  });
+}
+
+function popupHtml(n, isSelf) {
+  const u = n.user || {};
+  const dm = n.deviceMetrics || {};
+  const src = isSelf ? 'this node' :
+    `<span class="src ${n.viaMqtt ? 'mqtt' : 'rf'}">${n.viaMqtt ? 'VIA MQTT' : 'RF'}</span>`;
+  const btn = isSelf ? '' :
+    `<div class="row" style="margin-top:0.6rem;">
+       <button class="mini" onclick="openDM('${esc(u.id)}','${esc(u.longName || u.id)}')">Message</button>
+       <button class="mini" onclick="traceNode('${esc(u.id)}','${esc(u.longName || u.id)}')">Trace route</button>
+     </div>`;
+  return `<strong>${esc(u.longName || '(unknown)')}</strong> ${esc(u.shortName || '')}<br>` +
+    `<span class="muted">${esc(u.id || '')} · ${src}</span><br>` +
+    `Battery: ${dm.batteryLevel ?? '—'}%<br>` +
+    `Last heard: ${fmtAgo(n.lastHeard)}${btn}`;
+}
+
+function updateMap(nodes) {
+  if (!map) return;
+  const seen = new Set();
+  const bounds = [];
+  nodes.forEach(n => {
+    const pos = n.position || {};
+    if (!pos.latitude || !pos.longitude) return;
+    const id = n.num;
+    seen.add(id);
+    const isSelf = n.num === window.MY_NODE_NUM;
+    const latlng = [pos.latitude, pos.longitude];
+    bounds.push(latlng);
+    if (markers[id]) {
+      markers[id].setLatLng(latlng)
+        .setIcon(nodeIcon(n, isSelf))
+        .setPopupContent(popupHtml(n, isSelf));
+    } else {
+      markers[id] = L.marker(latlng, {icon: nodeIcon(n, isSelf)})
+        .addTo(map).bindPopup(popupHtml(n, isSelf));
+    }
+  });
+  Object.keys(markers).forEach(id => {
+    if (!seen.has(Number(id))) { map.removeLayer(markers[id]); delete markers[id]; }
+  });
+  if (bounds.length && !window.MAP_FIT_DONE) {
+    map.fitBounds(bounds, {maxZoom: 13, padding: [30, 30]});
+    window.MAP_FIT_DONE = true;
+  }
+}
+
+async function refreshNodes() {
+  const tbody = document.querySelector('#node-table tbody');
+  try {
+    const r = await fetch('/api/nodes');
+    // Never swallow this silently: a server-side error here used to look
+    // identical to "the mesh is quiet", which hid a hard 500 for hours.
+    if (!r.ok) {
+      tbody.innerHTML = `<tr><td colspan="11" class="muted">Node list failed — /api/nodes returned ${r.status}. Check <code>journalctl -u cybermesh</code>.</td></tr>`;
+      return;
+    }
+    LAST_NODES = await r.json();
+    await refreshNodeMeta();
+    render();
+  } catch (e) {
+    tbody.innerHTML = '<tr><td colspan="11" class="muted">Node list request failed: ' + esc(e.message) + '</td></tr>';
+  }
+}
+
+function render() {
+    const tbody = document.querySelector('#node-table tbody');
+    const all = LAST_NODES;
+    const nodes = all.filter(passesFilter);
+    updateMap(nodes);
+
+    const viaMqtt = nodes.filter(n => n.viaMqtt).length;
+    const hidden = all.length - nodes.length;
+    document.getElementById('node-counts').textContent =
+      `— ${nodes.length} shown, ${nodes.length - viaMqtt} RF, ${viaMqtt} via MQTT` +
+      (hidden ? `, ${hidden} filtered out` : '');
+    const o = window.ORIGIN;
+    document.getElementById('origin-note').textContent = o
+      ? `distances from ${o.source === 'gps' ? 'this node’s GPS' : 'configured home'} ` +
+        `(${o.lat.toFixed(3)}, ${o.lon.toFixed(3)})`
+      : 'no origin set — distance filtering unavailable';
+
+    if (!nodes.length) {
+      tbody.innerHTML = '<tr><td colspan="11" class="muted">No nodes match this filter</td></tr>';
+      return;
+    }
+    sortNodes(nodes);
+    tbody.innerHTML = nodes.map(n => {
+      const u = n.user || {};
+      const dm = n.deviceMetrics || {};
+      const pos = n.position || {};
+      const isSelf = n.num === window.MY_NODE_NUM;
+      const posStr = (pos.latitude && pos.longitude)
+        ? pos.latitude.toFixed(4) + ', ' + pos.longitude.toFixed(4) : '—';
+      const src = isSelf ? '<span class="muted src">SELF</span>'
+        : `<span class="src ${n.viaMqtt ? 'mqtt' : 'rf'}">${n.viaMqtt ? 'MQTT' : 'RF'}</span>`;
+      const miles = nodeMiles(n);
+      const hasPos = !!(pos.latitude && pos.longitude);
+      const fav = isFavorite(n);
+      const pathCount = u.id ? (SAVED_TRACE_COUNTS[u.id] || 0) : 0;
+      const nameCell = esc(u.longName || '(unknown)') +
+        (pathCount ? `<span class="path-badge" title="${pathCount} saved traceroute(s)">path</span>` : '');
+      const favBtn = isSelf ? '' : `<button class="star-btn${fav ? ' fav' : ''}" title="${fav ? 'Unfavorite' : 'Favorite'}" onclick="event.stopPropagation();toggleFavorite('${esc(u.id)}')">${fav ? '★' : '☆'}</button>`;
+      const actions = isSelf ? '' : `
+        <button class="mini" onclick="event.stopPropagation();openDM('${esc(u.id)}','${esc(u.longName || u.id)}')">DM</button>
+        <button class="mini" onclick="event.stopPropagation();traceNode('${esc(u.id)}','${esc(u.longName || u.id)}')">Trace</button>
+        <button class="mini" onclick="event.stopPropagation();openNotes('${esc(u.id)}','${esc(u.longName || u.id)}')">Notes</button>`;
+      return `<tr onclick="focusNode(${n.num}, ${hasPos})" class="${fav ? 'fav-row' : ''}">
+        <td>${favBtn}</td>
+        <td class="sym">${esc(u.shortName || '')}</td>
+        <td>${nameCell}</td>
+        <td class="muted">${esc(u.id || '')}</td>
+        <td>${src}</td>
+        <td class="muted">${miles === null ? '—' : miles.toFixed(1) + ' mi'}</td>
+        <td>${dm.batteryLevel != null ? dm.batteryLevel + '%' : '—'}</td>
+        <td>${n.snr != null ? n.snr : '—'}</td>
+        <td class="muted">${fmtAgo(n.lastHeard)}</td>
+        <td class="muted">${posStr}</td>
+        <td style="white-space:nowrap;">${actions}</td>
+      </tr>`;
+    }).join('');
+}
+
+function focusNode(num, hasPos) {
+  if (!hasPos) { toast('That node has never reported a position', true); return; }
+  const m = markers[num];
+  if (!m) { toast('Node is filtered off the map', true); return; }
+  map.setView(m.getLatLng(), Math.max(map.getZoom(), 12), {animate: true});
+  m.openPopup();
+  document.getElementById('map').scrollIntoView({behavior: 'smooth', block: 'nearest'});
+}
+
+// View preferences survive reloads and PWA relaunches — a filter you have to
+// re-pick every visit isn't much of a filter.
+const PREFS_KEY = 'cybermesh.viewprefs';
+function loadPrefs() {
+  try { return JSON.parse(localStorage.getItem(PREFS_KEY)) || {}; }
+  catch (e) { return {}; }
+}
+function savePrefs() {
+  try {
+    localStorage.setItem(PREFS_KEY, JSON.stringify({
+      dist: document.getElementById('dist-filter').value,
+      nopos: document.getElementById('show-nopos').checked,
+      favOnly: document.getElementById('fav-only').checked,
+      heard: document.getElementById('heard-filter').value,
+      search: document.getElementById('node-search').value,
+      sortKey: SORT.key,
+      sortDir: SORT.dir,
+    }));
+  } catch (e) {}
+}
+
+const PREFS = loadPrefs();
+// Default view: most recently heard first.
+let SORT = {key: PREFS.sortKey || 'heard', dir: PREFS.sortDir || 'desc'};
+if (PREFS.dist !== undefined) document.getElementById('dist-filter').value = PREFS.dist;
+if (PREFS.nopos !== undefined) document.getElementById('show-nopos').checked = PREFS.nopos;
+if (PREFS.favOnly !== undefined) document.getElementById('fav-only').checked = PREFS.favOnly;
+if (PREFS.heard !== undefined) document.getElementById('heard-filter').value = PREFS.heard;
+if (PREFS.search !== undefined) document.getElementById('node-search').value = PREFS.search;
+
+const SORT_KEYS = {
+  fav:     n => (isFavorite(n) ? 1 : null),
+  name:    n => ((n.user || {}).longName || (n.user || {}).id || '').toLowerCase(),
+  dist:    n => nodeMiles(n),
+  snr:     n => (n.snr == null ? null : n.snr),
+  battery: n => ((n.deviceMetrics || {}).batteryLevel ?? null),
+  heard:   n => (n.lastHeard || null),
+};
+
+function sortNodes(nodes) {
+  const get = SORT_KEYS[SORT.key] || SORT_KEYS.heard;
+  const sign = SORT.dir === 'asc' ? 1 : -1;
+  nodes.sort((a, b) => {
+    const va = get(a), vb = get(b);
+    // Nodes missing the sort value always sink to the bottom, whichever way
+    // the column is pointing — a node with no SNR isn't "the best" or "the
+    // worst", it's just unknown.
+    if (va === null && vb === null) return 0;
+    if (va === null) return 1;
+    if (vb === null) return -1;
+    if (typeof va === 'string') return va.localeCompare(vb) * sign;
+    return (va - vb) * sign;
+  });
+}
+
+function applySortHeaders() {
+  document.querySelectorAll('#node-table th.sortable').forEach(th => {
+    th.classList.remove('asc', 'desc');
+    if (th.dataset.sort === SORT.key) th.classList.add(SORT.dir);
+  });
+}
+
+document.querySelectorAll('#node-table th.sortable').forEach(th => {
+  th.addEventListener('click', () => {
+    const key = th.dataset.sort;
+    if (SORT.key === key) {
+      SORT.dir = SORT.dir === 'asc' ? 'desc' : 'asc';
+    } else {
+      // Sensible first click per column: nearest first, strongest signal
+      // first, most recent first — but A-Z for names.
+      SORT.key = key;
+      SORT.dir = (key === 'name' || key === 'dist') ? 'asc' : 'desc';
+    }
+    applySortHeaders();
+    savePrefs();
+    render();
+  });
+});
+
+function refilter() {
+  window.MAP_FIT_DONE = false;  // rezoom to whatever the new filter selected
+  savePrefs();
+  render();
+}
+document.getElementById('dist-filter').addEventListener('change', refilter);
+document.getElementById('show-nopos').addEventListener('change', refilter);
+document.getElementById('fav-only').addEventListener('change', refilter);
+document.getElementById('heard-filter').addEventListener('change', refilter);
+// Search doesn't re-fit the map on every keystroke — that would make the map
+// jump around while typing. The other filters change less often, so a re-fit
+// there is a feature, not noise.
+document.getElementById('node-search').addEventListener('input', () => { savePrefs(); render(); });
+
+async function toggleFavorite(nodeId) {
+  if (!nodeId) return;
+  const cur = !!(NODE_META[nodeId] && NODE_META[nodeId].favorite);
+  try {
+    const r = await fetch('/api/nodes/' + encodeURIComponent(nodeId) + '/meta', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({favorite: !cur}),
+    });
+    const d = await r.json();
+    if (d.error) { toast(d.error, true); return; }
+    NODE_META[nodeId] = NODE_META[nodeId] || {};
+    NODE_META[nodeId].favorite = !cur;
+    NODE_META[nodeId].notes = NODE_META[nodeId].notes || '';
+    render();
+  } catch (e) { toast('favorite toggle failed', true); }
+}
+
+let DM_TARGET = null;
+function openDM(nodeId, name) {
+  if (!nodeId) { toast('That node has no ID yet — nothing to address', true); return; }
+  DM_TARGET = nodeId;
+  document.getElementById('dm-title').textContent = 'Direct message';
+  document.getElementById('dm-sub').textContent = name + '  ·  ' + nodeId;
+  const t = document.getElementById('dm-text');
+  t.value = '';
+  document.getElementById('dm-count').textContent = '0/200';
+  document.getElementById('dm-backdrop').classList.add('open');
+  t.focus();
+}
+function closeDM() {
+  document.getElementById('dm-backdrop').classList.remove('open');
+  DM_TARGET = null;
+}
+document.getElementById('dm-text').addEventListener('input', e => {
+  document.getElementById('dm-count').textContent = e.target.value.length + '/200';
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDM(); });
+
+async function sendDM() {
+  const text = document.getElementById('dm-text').value.trim();
+  if (!text || !DM_TARGET) return;
+  const to = DM_TARGET;
+  try {
+    const r = await fetch('/api/messages', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({text: text, to: to, channel: 0})
+    });
+    const d = await r.json();
+    if (d.error) { toast(d.error, true); return; }
+    closeDM();
+    // Land in the conversation so the delivery status is actually watchable —
+    // an ack takes a few seconds and there's nowhere to see it on this page.
+    location.href = '/messages?to=' + encodeURIComponent(to);
+  } catch (e) { toast('send failed', true); }
+}
+
+async function traceNode(nodeId, name) {
+  if (!nodeId) { toast('That node has no ID yet', true); return; }
+  try {
+    const r = await fetch('/api/traceroute', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({to: nodeId})
+    });
+    const d = await r.json();
+    if (d.error) { toast(d.error, true); return; }
+    toast('Tracing route to ' + name + '…');
+    refreshTraceroutes();
+    document.getElementById('traceroutes').scrollIntoView({behavior: 'smooth', block: 'nearest'});
+  } catch (e) { toast('traceroute request failed', true); }
+}
+
+function hopChain(hops) {
+  return hops.map(h =>
+    `<span title="${esc(h.id)}">${esc(h.name)}</span>` +
+    (h.snr != null ? ` <span class="muted">(${h.snr} dB)</span>` : '')
+  ).join(' <span class="muted">→</span> ');
+}
+
+// `t.to`/`node_id` fields are raw node ids ("!abcd1234") — resolve against
+// the currently-known node list for a human name, same as the map/table do.
+function nodeName(id) {
+  if (!id) return id;
+  const n = LAST_NODES.find(x => (x.user || {}).id === id);
+  const name = n && (n.user || {}).longName;
+  return name ? `${name} <span class="muted" title="${esc(id)}">(${esc(id)})</span>` : esc(id);
+}
+
+async function refreshTraceroutes() {
+  try {
+    const r = await fetch('/api/traceroute');
+    if (!r.ok) return;
+    const list = await r.json();
+    const box = document.getElementById('traceroutes');
+    if (!list.length) {
+      box.innerHTML = '<span class="muted">None yet — trace a node from the map or the list above.</span>';
+      return;
+    }
+    box.innerHTML = list.map(t => {
+      let body;
+      if (t.status === 'pending') {
+        body = '<span class="muted">waiting for reply…</span>';
+      } else if (t.status === 'failed') {
+        body = `<span class="st-failed">✕ ${esc(t.error || 'failed')}</span>`;
+      } else {
+        body = `<div>${hopChain(t.route)}</div>` +
+          (t.route_back && t.route_back.length
+            ? `<div class="muted" style="margin-top:0.2rem;">back: ${hopChain(t.route_back)}</div>` : '') +
+          `<div class="muted" style="margin-top:0.2rem;">${t.hops_there === 0 ? 'direct — no intermediate hops' : t.hops_there + ' hop(s) each way'}` +
+          ` <button class="mini" style="margin-left:0.5rem;" onclick="saveTraceroute('${esc(t.to)}')">Save as proven path</button></div>`;
+      }
+      return `<div style="padding:0.45rem 0;border-bottom:1px solid var(--border);">
+        <div><strong>${nodeName(t.to)}</strong> <span class="muted">${fmtAgo(Math.floor(t.ts))}</span></div>
+        ${body}
+      </div>`;
+    }).join('');
+  } catch (e) {}
+}
+
+async function saveTraceroute(nodeId) {
+  try {
+    const r = await fetch('/api/traceroute/save', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({node_id: nodeId}),
+    });
+    const d = await r.json();
+    if (d.error) { toast(d.error, true); return false; }
+    toast('Saved as a proven path');
+    SAVED_TRACE_COUNTS[nodeId] = (SAVED_TRACE_COUNTS[nodeId] || 0) + 1;
+    render();
+    return true;
+  } catch (e) { toast('save failed', true); return false; }
+}
+
+// Node notes / favorite modal — shares the "one open editor at a time"
+// pattern with the DM composer above.
+let NOTES_TARGET = null;
+function openNotes(nodeId, name) {
+  if (!nodeId) { toast('That node has no ID yet', true); return; }
+  NOTES_TARGET = nodeId;
+  document.getElementById('notes-title').textContent = 'Node notes';
+  document.getElementById('notes-sub').textContent = name + '  ·  ' + nodeId;
+  const meta = NODE_META[nodeId] || {favorite: false, notes: ''};
+  document.getElementById('notes-fav').checked = !!meta.favorite;
+  document.getElementById('notes-text').value = meta.notes || '';
+  document.getElementById('notes-backdrop').style.display = 'flex';
+  refreshSavedTraceroutesList();
+}
+function closeNotes() {
+  document.getElementById('notes-backdrop').style.display = 'none';
+  NOTES_TARGET = null;
+}
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeNotes(); });
+
+async function saveNotes() {
+  if (!NOTES_TARGET) return;
+  const favorite = document.getElementById('notes-fav').checked;
+  const notes = document.getElementById('notes-text').value;
+  try {
+    const r = await fetch('/api/nodes/' + encodeURIComponent(NOTES_TARGET) + '/meta', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({favorite: favorite, notes: notes}),
+    });
+    const d = await r.json();
+    if (d.error) { toast(d.error, true); return; }
+    NODE_META[NOTES_TARGET] = {favorite: d.favorite, notes: d.notes, updated_ts: Date.now() / 1000};
+    toast('Saved');
+    closeNotes();
+    render();
+  } catch (e) { toast('save failed', true); }
+}
+
+async function saveCurrentTraceroute() {
+  if (!NOTES_TARGET) return;
+  if (await saveTraceroute(NOTES_TARGET)) refreshSavedTraceroutesList();
+}
+
+async function refreshSavedTraceroutesList() {
+  if (!NOTES_TARGET) return;
+  const box = document.getElementById('notes-saved-list');
+  try {
+    const r = await fetch('/api/traceroute/saved?node_id=' + encodeURIComponent(NOTES_TARGET));
+    const list = await r.json();
+    if (!list.length) { box.innerHTML = 'None saved yet.'; return; }
+    box.innerHTML = list.map(t => `
+      <div class="saved-trace">
+        <div class="row">
+          <span>${fmtAgo(Math.floor(t.ts))} — ${t.hops_there === 0 ? 'direct' : t.hops_there + ' hop(s)'}</span>
+          <button class="mini" style="margin-left:auto;" onclick="deleteSavedTraceroute(${t.id})">Delete</button>
+        </div>
+        <div class="muted">${hopChain(t.route)}</div>
+      </div>`).join('');
+  } catch (e) { box.innerHTML = '<span class="muted">Failed to load</span>'; }
+}
+
+async function deleteSavedTraceroute(id) {
+  try {
+    await fetch('/api/traceroute/saved/' + id, {method: 'DELETE'});
+    if (NOTES_TARGET) SAVED_TRACE_COUNTS[NOTES_TARGET] = Math.max(0, (SAVED_TRACE_COUNTS[NOTES_TARGET] || 1) - 1);
+    refreshSavedTraceroutesList();
+    render();
+  } catch (e) { toast('delete failed', true); }
+}
+
+async function adminAction(action) {
+  if (!confirm('Send "' + action + '" to the node?')) return;
+  try {
+    const r = await fetch('/api/admin/' + action, {method: 'POST'});
+    const d = await r.json();
+    if (d.error) toast(d.error, true); else toast(action + ' sent');
+  } catch (e) { toast('request failed', true); }
+}
+// ---- Channel Health chart ---------------------------------------------
+// Hand-rolled SVG, no charting library — matches the vendored-not-CDN
+// pattern already used for Leaflet. Channel utilization plots raw telemetry
+// samples directly (the node only self-reports every ~15-30 min, already
+// sparse enough). Ack success rate is a computed ratio, so it's bucketed
+// into fixed windows across the visible range — a single message doesn't
+// have a "rate", only a ratio over a window does. Buckets with zero send
+// attempts are left out entirely (a quiet period isn't "0% success").
+let HEALTH_RANGE = 86400; // seconds; 0 = all
+let HEALTH_TELEMETRY = [];
+let HEALTH_MESSAGES = [];
+
+function fmtPct(v) { return (v == null) ? '—' : Math.round(v) + '%'; }
+function fmtHealthTime(ts) {
+  return new Date(ts * 1000).toLocaleString([], {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'});
+}
+function fmtHealthAxisTick(ts, domainSpanSecs) {
+  const d = new Date(ts * 1000);
+  return domainSpanSecs <= 86400
+    ? d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})
+    : d.toLocaleDateString([], {month: 'short', day: 'numeric'});
+}
+
+async function loadHealthData() {
+  const since = HEALTH_RANGE ? (Date.now() / 1000 - HEALTH_RANGE) : null;
+  try {
+    const [tRes, mRes] = await Promise.all([
+      fetch('/api/telemetry-history' + (since ? ('?since=' + since) : '')),
+      fetch('/api/messages'),
+    ]);
+    HEALTH_TELEMETRY = tRes.ok ? await tRes.json() : [];
+    HEALTH_MESSAGES = mRes.ok ? await mRes.json() : [];
+  } catch (e) { HEALTH_TELEMETRY = []; HEALTH_MESSAGES = []; }
+  renderHealthChart();
+  updateCuHero();
+}
+
+// Thresholds roughly match what was observed live tonight: single digits to
+// low teens while acks were landing, 37.7% during a MAX_RETRANSMIT streak.
+function cuSeverity(pct) {
+  if (pct < 15) return {cls: 'ok', label: 'Low'};
+  if (pct < 30) return {cls: 'warn', label: 'Moderate'};
+  return {cls: 'danger', label: 'High'};
+}
+
+function updateCuHero() {
+  const valueEl = document.getElementById('cu-hero-value');
+  const qualEl = document.getElementById('cu-hero-qualifier');
+  const subEl = document.getElementById('cu-hero-sub');
+  const latest = HEALTH_TELEMETRY.length ? HEALTH_TELEMETRY[HEALTH_TELEMETRY.length - 1] : null;
+  if (!latest || latest.channel_utilization == null) {
+    valueEl.textContent = '—';
+    valueEl.className = 'stat-value';
+    qualEl.textContent = '';
+    subEl.textContent = 'No telemetry yet';
+    return;
+  }
+  const pct = latest.channel_utilization;
+  const sev = cuSeverity(pct);
+  valueEl.textContent = Math.round(pct * 10) / 10 + '%';
+  valueEl.className = 'stat-value ' + sev.cls;
+  qualEl.textContent = sev.label;
+  qualEl.className = 'stat-qualifier ' + sev.cls;
+  subEl.textContent = 'as of ' + fmtAgo(Math.floor(latest.ts));
+}
+
+function ackBuckets(domainStart, domainEnd) {
+  const BUCKETS = 30;
+  const width = (domainEnd - domainStart) / BUCKETS;
+  if (!(width > 0)) return [];
+  const counts = Array.from({length: BUCKETS}, () => ({ok: 0, total: 0}));
+  HEALTH_MESSAGES.forEach(m => {
+    if (m.from !== 'me') return;
+    if (!['delivered', 'failed', 'no_ack'].includes(m.status)) return;
+    if (m.ts < domainStart || m.ts > domainEnd) return;
+    const i = Math.min(BUCKETS - 1, Math.floor((m.ts - domainStart) / width));
+    counts[i].total++;
+    if (m.status === 'delivered') counts[i].ok++;
+  });
+  const out = [];
+  counts.forEach((c, i) => {
+    if (!c.total) return;
+    out.push({ts: domainStart + (i + 0.5) * width, pct: (c.ok / c.total) * 100});
+  });
+  return out;
+}
+
+function healthDomain() {
+  const now = Date.now() / 1000;
+  if (HEALTH_RANGE) return [now - HEALTH_RANGE, now];
+  let min = now, max = 0;
+  HEALTH_TELEMETRY.forEach(t => { min = Math.min(min, t.ts); max = Math.max(max, t.ts); });
+  HEALTH_MESSAGES.forEach(m => { if (m.from === 'me') { min = Math.min(min, m.ts); max = Math.max(max, m.ts); } });
+  return max > min ? [min, max] : [now - 3600, now];
+}
+
+function nearestPoint(points, ts) {
+  if (!points.length) return null;
+  let best = points[0], bestDiff = Math.abs(points[0].ts - ts);
+  for (const p of points) {
+    const diff = Math.abs(p.ts - ts);
+    if (diff < bestDiff) { best = p; bestDiff = diff; }
+  }
+  return best;
+}
+
+function renderHealthChart() {
+  const svg = document.getElementById('health-chart');
+  const [domainStart, domainEnd] = healthDomain();
+  const cuPoints = HEALTH_TELEMETRY
+    .filter(t => t.channel_utilization != null && t.ts >= domainStart && t.ts <= domainEnd)
+    .map(t => ({ts: t.ts, pct: t.channel_utilization}));
+  const ackPoints = ackBuckets(domainStart, domainEnd);
+
+  document.getElementById('health-empty').style.display = (cuPoints.length || ackPoints.length) ? 'none' : '';
+
+  const W = 800, H = 220, padL = 34, padR = 12, padT = 10, padB = 22;
+  const span = Math.max(1, domainEnd - domainStart);
+  const x = ts => padL + (W - padL - padR) * ((ts - domainStart) / span);
+  const y = pct => padT + (H - padT - padB) * (1 - Math.max(0, Math.min(100, pct)) / 100);
+  const pathFor = points => points.map((p, i) => `${i === 0 ? 'M' : 'L'}${x(p.ts).toFixed(1)},${y(p.pct).toFixed(1)}`).join(' ');
+
+  let html = '';
+  [0, 25, 50, 75, 100].forEach(v => {
+    const gy = y(v);
+    html += `<line class="health-gridline" x1="${padL}" y1="${gy}" x2="${W - padR}" y2="${gy}"/>`;
+    html += `<text class="health-axis-label" x="${padL - 6}" y="${gy + 3}" text-anchor="end">${v}</text>`;
+  });
+  const TICKS = 5;
+  for (let i = 0; i <= TICKS; i++) {
+    const ts = domainStart + span * (i / TICKS);
+    const anchor = i === 0 ? 'start' : (i === TICKS ? 'end' : 'middle');
+    html += `<text class="health-axis-label" x="${x(ts)}" y="${H - 6}" text-anchor="${anchor}">${esc(fmtHealthAxisTick(ts, span))}</text>`;
+  }
+  if (cuPoints.length > 1) html += `<path class="health-line-cu" d="${pathFor(cuPoints)}"/>`;
+  if (ackPoints.length > 1) html += `<path class="health-line-ack" d="${pathFor(ackPoints)}"/>`;
+
+  function endMark(points, dotClass, labelClass) {
+    if (!points.length) return '';
+    const p = points[points.length - 1];
+    const cx = x(p.ts), cy = y(p.pct);
+    const anchor = cx > W - 40 ? 'end' : 'start';
+    const lx = anchor === 'end' ? cx - 8 : cx + 8;
+    return `<circle class="${dotClass}" cx="${cx}" cy="${cy}" r="4"/>` +
+      `<text class="health-endlabel ${labelClass}" x="${lx}" y="${cy + 4}" text-anchor="${anchor}">${Math.round(p.pct)}%</text>`;
+  }
+  html += endMark(cuPoints, 'health-dot-cu', 'health-endlabel-cu');
+  html += endMark(ackPoints, 'health-dot-ack', 'health-endlabel-ack');
+  html += `<rect id="health-hit" x="${padL}" y="${padT}" width="${W - padL - padR}" height="${H - padT - padB}" fill="transparent"/>`;
+  html += `<line id="health-crosshair" class="health-crosshair" x1="0" y1="${padT}" x2="0" y2="${H - padB}" style="display:none;"/>`;
+
+  svg.innerHTML = html;
+  wireHealthHover(cuPoints, ackPoints, domainStart, domainEnd, padL, padR, W);
+  renderHealthTable(cuPoints, ackPoints);
+}
+
+function wireHealthHover(cuPoints, ackPoints, domainStart, domainEnd, padL, padR, W) {
+  const hit = document.getElementById('health-hit');
+  const crosshair = document.getElementById('health-crosshair');
+  const tooltip = document.getElementById('health-tooltip');
+  const wrap = document.getElementById('health-chart-wrap');
+  const svg = document.getElementById('health-chart');
+  if (!hit) return;
+
+  function move(evt) {
+    const rect = svg.getBoundingClientRect();
+    const clientX = evt.touches ? evt.touches[0].clientX : evt.clientX;
+    const svgX = (clientX - rect.left) / rect.width * W;
+    const frac = Math.max(0, Math.min(1, (svgX - padL) / (W - padL - padR)));
+    const ts = domainStart + frac * (domainEnd - domainStart);
+    const cu = nearestPoint(cuPoints, ts);
+    const ack = nearestPoint(ackPoints, ts);
+    if (!cu && !ack) return;
+    crosshair.style.display = '';
+    crosshair.setAttribute('x1', svgX); crosshair.setAttribute('x2', svgX);
+    let tt = `<div class="tt-time">${esc(fmtHealthTime(ts))}</div>`;
+    if (cu) tt += `<div class="tt-row"><span class="tt-key" style="background:#3987e5;"></span>Channel util<span class="tt-val">${fmtPct(cu.pct)}</span></div>`;
+    if (ack) tt += `<div class="tt-row"><span class="tt-key" style="background:#d95926;"></span>Ack success<span class="tt-val">${fmtPct(ack.pct)}</span></div>`;
+    tooltip.innerHTML = tt;
+    tooltip.style.display = 'block';
+    const wrapRect = wrap.getBoundingClientRect();
+    let left = (clientX - wrapRect.left) + 14;
+    if (left + 170 > wrapRect.width) left = (clientX - wrapRect.left) - 170;
+    tooltip.style.left = Math.max(0, left) + 'px';
+    tooltip.style.top = '8px';
+  }
+  function leave() { crosshair.style.display = 'none'; tooltip.style.display = 'none'; }
+  hit.addEventListener('pointermove', move);
+  hit.addEventListener('pointerleave', leave);
+}
+
+function renderHealthTable(cuPoints, ackPoints) {
+  const rows = new Map();
+  cuPoints.forEach(p => rows.set(p.ts, {ts: p.ts, cu: p.pct, ack: null}));
+  ackPoints.forEach(p => {
+    const existing = rows.get(p.ts);
+    if (existing) existing.ack = p.pct; else rows.set(p.ts, {ts: p.ts, cu: null, ack: p.pct});
+  });
+  const sorted = [...rows.values()].sort((a, b) => b.ts - a.ts);
+  const tbody = document.querySelector('#health-table tbody');
+  tbody.innerHTML = sorted.length
+    ? sorted.map(r => `<tr><td>${esc(fmtHealthTime(r.ts))}</td><td>${fmtPct(r.cu)}</td><td>${fmtPct(r.ack)}</td></tr>`).join('')
+    : '<tr><td colspan="3" class="muted">No data yet</td></tr>';
+}
+
+function toggleHealthTable() {
+  const w = document.getElementById('health-table-wrap');
+  w.style.display = w.style.display === 'none' ? '' : 'none';
+}
+
+document.querySelectorAll('.range-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.range-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    HEALTH_RANGE = parseInt(btn.dataset.range, 10);
+    loadHealthData();
+  });
+});
+
+initMap();
+applySortHeaders();
+refreshNodes();
+refreshTraceroutes();
+loadHealthData();
+setInterval(refreshNodes, 10000);
+setInterval(refreshTraceroutes, 5000);
+setInterval(loadHealthData, 30000);
+{% endblock %}

@@ -1,0 +1,115 @@
+{% extends "base.html" %}
+{% block title %} — Config{% endblock %}
+{% block content %}
+<div class="panel">
+  <p class="muted" style="margin:0;">Every section is loaded below as a real form — no JSON. Fields are pulled straight from the node's own schema. Most changes need a reboot (Dashboard) to fully apply.</p>
+</div>
+
+<h2 style="color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;font-size:0.9rem;">Device config</h2>
+<div id="device-sections"></div>
+
+<h2 style="color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;font-size:0.9rem;margin-top:1.6rem;">Module config</h2>
+<div id="module-sections"></div>
+{% endblock %}
+{% block script %}
+const CONFIG_SECTIONS = {{ sections|tojson }};
+const MODULE_SECTIONS = {{ module_sections|tojson }};
+
+function labelize(name) {
+  return name.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+}
+
+function fieldRow(section, field, value) {
+  const id = `f-${section}-${field.name}`;
+  let control = '';
+  if (field.kind === 'bool') {
+    control = `
+      <label class="switch">
+        <input type="checkbox" id="${id}" ${value ? 'checked' : ''}>
+        <span class="slider"></span>
+      </label>`;
+  } else if (field.kind === 'enum') {
+    control = `<select id="${id}">` +
+      field.options.map(o => `<option value="${o}" ${o === value ? 'selected' : ''}>${o}</option>`).join('') +
+      `</select>`;
+  } else if (field.kind === 'int') {
+    control = `<input type="number" step="1" id="${id}" value="${value ?? 0}">`;
+  } else if (field.kind === 'float') {
+    control = `<input type="number" step="any" id="${id}" value="${value ?? 0}">`;
+  } else if (field.kind === 'bytes') {
+    control = `<input type="text" id="${id}" value="${(value ?? '').toString().replace(/"/g,'&quot;')}" disabled title="Read-only — not editable from here">`;
+  } else if (field.kind === 'list') {
+    const joined = Array.isArray(value) ? value.join(', ') : '';
+    control = `<input type="text" id="${id}" value="${joined}" placeholder="comma-separated">`;
+  } else {
+    control = `<input type="text" id="${id}" value="${(value ?? '').toString().replace(/"/g,'&quot;')}">`;
+  }
+  return `<div class="field-row"><label for="${id}">${labelize(field.name)}</label><div class="field-control">${control}</div></div>`;
+}
+
+function readFieldValue(section, field) {
+  const id = `f-${section}-${field.name}`;
+  const el = document.getElementById(id);
+  if (field.kind === 'bool') return el.checked;
+  if (field.kind === 'enum') return el.value;
+  if (field.kind === 'int') return parseInt(el.value, 10) || 0;
+  if (field.kind === 'float') return parseFloat(el.value) || 0;
+  if (field.kind === 'bytes') return undefined; // never submitted — read-only
+  if (field.kind === 'list') {
+    const raw = el.value.split(',').map(s => s.trim()).filter(s => s.length);
+    if (field.item_kind === 'int' || field.item_kind === 'float') return raw.map(Number);
+    return raw;
+  }
+  return el.value;
+}
+
+function sectionCard(kindGroup, section, fields, values) {
+  if (!fields.length) {
+    return `<div class="panel" style="margin-bottom:0.8rem;">
+      <div class="row"><strong>${labelize(section)}</strong><span class="muted">no editable fields</span></div>
+    </div>`;
+  }
+  const rows = fields.map(f => fieldRow(section, f, values[f.name])).join('');
+  return `
+    <div class="panel" style="margin-bottom:0.8rem;">
+      <div class="row">
+        <strong>${labelize(section)}</strong>
+        <button style="margin-left:auto;" onclick="saveSection('${kindGroup}', '${section}')">Save &amp; apply</button>
+      </div>
+      <div class="field-grid">${rows}</div>
+    </div>`;
+}
+
+let SCHEMA = null, VALUES = null;
+
+async function loadAll() {
+  const [schemaRes, valuesRes] = await Promise.all([
+    fetch('/api/config/schema'), fetch('/api/config')
+  ]);
+  SCHEMA = await schemaRes.json();
+  VALUES = await valuesRes.json();
+
+  document.getElementById('device-sections').innerHTML =
+    CONFIG_SECTIONS.map(s => sectionCard('config', s, SCHEMA.config[s] || [], VALUES.config[s] || {})).join('');
+  document.getElementById('module-sections').innerHTML =
+    MODULE_SECTIONS.map(s => sectionCard('module_config', s, SCHEMA.module_config[s] || [], VALUES.module_config[s] || {})).join('');
+}
+
+async function saveSection(kindGroup, section) {
+  const fields = SCHEMA[kindGroup][section] || [];
+  const payload = {};
+  for (const f of fields) {
+    const v = readFieldValue(section, f);
+    if (v !== undefined) payload[f.name] = v;
+  }
+  const r = await fetch('/api/config/' + section, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload)
+  });
+  const d = await r.json();
+  if (d.error) toast(d.error, true);
+  else toast('Saved ' + labelize(section) + ' — reboot the node to apply');
+}
+loadAll();
+{% endblock %}

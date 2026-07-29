@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>CyberMesh{% block title %}{% endblock %}</title>
+<link rel="manifest" href="/static/manifest.json">
+<link rel="icon" href="/static/favicon-32.png" sizes="32x32">
+<link rel="icon" href="/static/icon-192.png" sizes="192x192">
+<link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+<meta name="theme-color" content="#0b0f14">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="CyberMesh">
+<style>
+  :root {
+    --bg: #0b0f14;
+    --panel: #131a22;
+    --border: #1f2a35;
+    --text: #d7e2ea;
+    --muted: #7c94a6;
+    --accent: #33e0ff;
+    --accent2: #ff3388;
+    --ok: #33ff99;
+    --warn: #ffcc33;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  body {
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 1.5rem;
+    padding: calc(0.9rem + env(safe-area-inset-top)) 1.4rem 0.9rem;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+  header h1 {
+    font-size: 1.1rem;
+    margin: 0;
+    color: var(--accent);
+    letter-spacing: 0.04em;
+  }
+  nav a {
+    color: var(--muted);
+    text-decoration: none;
+    margin-right: 1.1rem;
+    font-size: 0.9rem;
+  }
+  nav a.active, nav a:hover { color: var(--accent); }
+  main { padding: 1.4rem; max-width: 980px; margin: 0 auto; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1rem 1.2rem;
+    margin-bottom: 1.2rem;
+  }
+  .panel h2 {
+    margin-top: 0;
+    font-size: 0.95rem;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+  th, td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; }
+  .badge {
+    display: inline-block;
+    padding: 0.15rem 0.55rem;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    font-weight: 600;
+  }
+  .badge.ok { background: rgba(51,255,153,0.15); color: var(--ok); }
+  .badge.bad { background: rgba(255,51,136,0.15); color: var(--accent2); }
+  .field-grid {
+    display: grid;
+    grid-template-columns: minmax(140px, 45%) 1fr;
+    row-gap: 0.55rem;
+    column-gap: 1rem;
+    align-items: center;
+    margin-top: 0.6rem;
+  }
+  .field-row { display: contents; }
+  .field-row label { font-size: 0.85rem; color: var(--muted); }
+  .field-control input, .field-control select { width: 100%; }
+  .field-control input:disabled { opacity: 0.5; cursor: not-allowed; }
+  .switch { position: relative; display: inline-block; width: 42px; height: 24px; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch .slider {
+    position: absolute; cursor: pointer; inset: 0;
+    background: #0e151c; border: 1px solid var(--border);
+    border-radius: 999px; transition: 0.15s;
+  }
+  .switch .slider::before {
+    content: ""; position: absolute; height: 16px; width: 16px;
+    left: 3px; bottom: 3px; background: var(--muted);
+    border-radius: 50%; transition: 0.15s;
+  }
+  .switch input:checked + .slider { border-color: var(--accent); background: rgba(51,224,255,0.12); }
+  .switch input:checked + .slider::before { transform: translateX(18px); background: var(--accent); }
+  button, select, textarea, input[type=text], input[type=number] {
+    background: #0e151c;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.45rem 0.6rem;
+    font-family: inherit;
+    font-size: 0.88rem;
+  }
+  button {
+    cursor: pointer;
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+  button:hover { background: rgba(51,224,255,0.1); }
+  button.danger { color: var(--accent2); border-color: var(--accent2); }
+  button.danger:hover { background: rgba(255,51,136,0.1); }
+  textarea { width: 100%; min-height: 260px; font-family: ui-monospace, monospace; font-size: 0.82rem; }
+  .row { display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; }
+  .muted { color: var(--muted); font-size: 0.85rem; }
+  .toast {
+    position: fixed; bottom: 1rem; right: 1rem;
+    background: var(--panel); border: 1px solid var(--border);
+    padding: 0.6rem 1rem; border-radius: 8px; font-size: 0.85rem;
+    display: none;
+  }
+</style>
+{% block head %}{% endblock %}
+</head>
+<body>
+<header>
+  <h1>&#9737; CYBERMESH</h1>
+  <nav>
+    <a href="/" class="{{ 'active' if active=='dashboard' }}">Dashboard</a>
+    <a href="/messages" class="{{ 'active' if active=='messages' }}">Messages</a>
+    <a href="/config" class="{{ 'active' if active=='config' }}">Config</a>
+    <a href="/channels" class="{{ 'active' if active=='channels' }}">Channels</a>
+  </nav>
+  <span class="muted" id="conn-status" style="margin-left:auto;">checking...</span>
+</header>
+<main>
+{% block content %}{% endblock %}
+</main>
+<div class="toast" id="toast"></div>
+<script>
+function toast(msg, isError) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.display = 'block';
+  t.style.borderColor = isError ? 'var(--accent2)' : 'var(--accent)';
+  setTimeout(() => { t.style.display = 'none'; }, 3500);
+}
+async function refreshStatus() {
+  try {
+    const r = await fetch('/api/status');
+    const d = await r.json();
+    const el = document.getElementById('conn-status');
+    if (d.connected) {
+      el.innerHTML = '<span class="badge ok">connected</span> ' + (d.transport === 'serial' ? 'USB ' : '') + d.host;
+    } else {
+      let extra = d.last_error || d.host;
+      if (d.watchdog_enabled && d.down_for_secs != null) {
+        extra += ` (down ${d.down_for_secs}s`;
+        if (d.last_auto_reboot) {
+          const since = Math.floor(Date.now()/1000 - d.last_auto_reboot);
+          extra += `, last auto-reboot ${since}s ago`;
+        }
+        extra += ')';
+      }
+      el.innerHTML = '<span class="badge bad">disconnected</span> ' + extra;
+    }
+    window.MY_NODE_NUM = d.my_node_num;
+    window.ORIGIN = d.origin;
+  } catch (e) {}
+}
+refreshStatus();
+setInterval(refreshStatus, 8000);
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/service-worker.js');
+  });
+}
+{% block script %}{% endblock %}
+</script>
+</body>
+</html>

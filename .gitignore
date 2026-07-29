@@ -1,0 +1,7 @@
+.env
+messages.db
+messages.db-journal
+__pycache__/
+*.pyc
+venv/
+.DS_Store

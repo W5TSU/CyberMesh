@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b0f14"/>
+      <stop offset="100%" stop-color="#111a24"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="38%" r="60%">
+      <stop offset="0%" stop-color="#33e0ff" stop-opacity="0.35"/>
+      <stop offset="100%" stop-color="#33e0ff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="beam" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#33e0ff"/>
+      <stop offset="100%" stop-color="#1a8fb0"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="512" height="512" fill="url(#bg)"/>
+  <g transform="translate(256,256) scale(0.72) translate(-256,-256)">
+    <circle cx="256" cy="195" r="190" fill="url(#glow)"/>
+    <g fill="none" stroke="#33e0ff" stroke-width="14" stroke-linecap="round" opacity="0.9">
+      <path d="M 196 150 A 90 90 0 0 1 316 150"/>
+      <path d="M 164 118 A 135 135 0 0 1 348 118" opacity="0.55"/>
+    </g>
+    <path d="M 256 150 L 296 372 L 216 372 Z" fill="url(#beam)"/>
+    <circle cx="256" cy="150" r="16" fill="#eafcff"/>
+    <g stroke="#33e0ff" stroke-width="6" opacity="0.85">
+      <line x1="256" y1="330" x2="140" y2="392"/>
+      <line x1="256" y1="330" x2="372" y2="392"/>
+      <line x1="140" y1="392" x2="372" y2="392"/>
+      <line x1="256" y1="330" x2="256" y2="412"/>
+    </g>
+    <circle cx="256" cy="330" r="15" fill="#0b0f14" stroke="#33e0ff" stroke-width="8"/>
+    <circle cx="140" cy="392" r="20" fill="#0b0f14" stroke="#ff3388" stroke-width="9"/>
+    <circle cx="372" cy="392" r="20" fill="#0b0f14" stroke="#ff3388" stroke-width="9"/>
+    <circle cx="256" cy="412" r="20" fill="#0b0f14" stroke="#ff3388" stroke-width="9"/>
+  </g>
+</svg>

@@ -1,0 +1,298 @@
+{% extends "base.html" %}
+{% block title %} — Messages{% endblock %}
+{% block head %}
+<style>
+  details.feed { border: 1px solid var(--border); border-radius: 10px; margin-bottom: 0.9rem; background: var(--panel); }
+  details.feed > summary {
+    cursor: pointer; padding: 0.7rem 0.9rem; font-size: 0.9rem;
+    display: flex; align-items: center; gap: 0.6rem; list-style: none;
+  }
+  details.feed > summary::-webkit-details-marker { display: none; }
+  details.feed > summary::before { content: "\25B8"; color: var(--muted); transition: transform 0.12s; }
+  details.feed[open] > summary::before { transform: rotate(90deg); }
+  details.feed > summary strong { color: var(--accent); }
+  .count { margin-left: auto; color: var(--muted); font-size: 0.78rem; }
+  .feed-body { padding: 0 0.9rem 0.9rem; }
+
+  .convo { display: flex; flex-direction: column; gap: 0.45rem; max-height: 46vh; overflow-y: auto; padding: 0.2rem 0.1rem 0.5rem; }
+  .bubble { max-width: 78%; padding: 0.5rem 0.75rem; border-radius: 14px; font-size: 0.9rem; line-height: 1.35; word-wrap: break-word; }
+  .bubble.them { align-self: flex-start; background: #17222c; border: 1px solid var(--border); border-bottom-left-radius: 4px; }
+  .bubble.me { align-self: flex-end; background: rgba(51,224,255,0.13); border: 1px solid rgba(51,224,255,0.35); border-bottom-right-radius: 4px; }
+  .bubble .sender { font-size: 0.74rem; color: var(--accent); font-weight: 600; margin-bottom: 0.15rem; }
+  .bubble .meta { font-size: 0.68rem; color: var(--muted); margin-top: 0.3rem; display: flex; gap: 0.45rem; align-items: center; justify-content: flex-end; }
+  .bubble.them .meta { justify-content: flex-start; }
+  .st-delivered { color: var(--ok); }
+  .st-failed { color: var(--accent2); font-weight: 600; }
+  .st-no_ack { color: var(--warn); }
+  .st-sending { color: var(--muted); }
+  .tag { font-size: 0.64rem; font-weight: 700; letter-spacing: 0.04em; padding: 0.02rem 0.3rem; border-radius: 4px; }
+  .tag.mqtt { background: rgba(255,204,51,0.15); color: var(--warn); }
+  .day { align-self: center; font-size: 0.7rem; color: var(--muted); margin: 0.4rem 0 0.1rem; }
+  .dm-chips { display: flex; gap: 0.4rem; flex-wrap: wrap; margin-bottom: 0.6rem; }
+  .chip { background: #0e151c; border: 1px solid var(--border); color: var(--muted); border-radius: 999px; padding: 0.25rem 0.7rem; font-size: 0.8rem; cursor: pointer; display: inline-flex; align-items: center; gap: 0.35rem; }
+  .chip.active { border-color: var(--accent); color: var(--accent); background: rgba(51,224,255,0.1); }
+  .chip.unread { color: #e8f2f7; border-color: rgba(255,51,136,0.5); font-weight: 600; }
+  .unread-count {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 1.15rem; height: 1.15rem; padding: 0 0.3rem; border-radius: 999px;
+    background: var(--accent2); color: #0b0e12; font-size: 0.68rem; font-weight: 700;
+  }
+  summary .unread-count { margin-left: 0.35rem; }
+</style>
+{% endblock %}
+{% block content %}
+<div id="feeds"></div>
+{% endblock %}
+{% block script %}
+function esc(s) {
+  return (s ?? '').toString().replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function fmtTime(ts) { return new Date(ts * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}); }
+function dayKey(ts) { return new Date(ts * 1000).toDateString(); }
+
+const BROADCAST = '^all';
+const OPEN_KEY = 'cybermesh.openfeeds';
+let NODES = {}, CHANNELS = [], MSGS = [];
+let ACTIVE_DM = new URLSearchParams(location.search).get('to') || null;
+
+// Per-peer "last read" timestamp, so a DM chip can show an unread badge —
+// same localStorage pattern as the open-feeds/view-prefs state elsewhere.
+const DM_READ_KEY = 'cybermesh.dmread';
+function loadDmRead() {
+  try { return JSON.parse(localStorage.getItem(DM_READ_KEY)) || {}; }
+  catch (e) { return {}; }
+}
+function saveDmRead() {
+  try { localStorage.setItem(DM_READ_KEY, JSON.stringify(DM_READ)); } catch (e) {}
+}
+let DM_READ = loadDmRead();
+
+function unreadCount(peer) {
+  const lastRead = DM_READ[peer] || 0;
+  return MSGS.filter(m => m.direct && m.from === peer && m.ts > lastRead).length;
+}
+// Only counts as "read" while the tab is actually visible — otherwise the 5s
+// background poll would silently mark messages read nobody looked at yet.
+function markRead(peer) {
+  if (!peer || document.visibilityState !== 'visible') return;
+  const msgs = MSGS.filter(m => peerOf(m) === peer);
+  if (!msgs.length) return;
+  const maxTs = Math.max(...msgs.map(m => m.ts));
+  if ((DM_READ[peer] || 0) < maxTs) {
+    DM_READ[peer] = maxTs;
+    saveDmRead();
+  }
+}
+
+function openSet() {
+  try { return new Set(JSON.parse(localStorage.getItem(OPEN_KEY)) || ['ch0']); }
+  catch (e) { return new Set(['ch0']); }
+}
+function rememberOpen() {
+  const open = [...document.querySelectorAll('details.feed')]
+    .filter(d => d.open).map(d => d.dataset.feed);
+  try { localStorage.setItem(OPEN_KEY, JSON.stringify(open)); } catch (e) {}
+}
+
+function nameFor(id) {
+  if (!id || id === BROADCAST) return 'Broadcast';
+  const u = (NODES[id] || {}).user || {};
+  return ((u.shortName ? u.shortName + ' ' : '') + (u.longName || id)).trim();
+}
+function channelLabel(i) {
+  const c = CHANNELS[i];
+  const n = c && c.settings && c.settings.name;
+  if (n) return n;
+  return i === 0 ? 'LongFast (primary)' : 'Channel ' + i;
+}
+function peerOf(m) { return m.direct ? (m.from === 'me' ? m.to : m.from) : null; }
+
+function statusText(m) {
+  if (m.from !== 'me') return '';
+  if (m.status === 'sending') return '<span class="st-sending">sending…</span>';
+  if (m.status === 'sent') return '<span class="st-sending">sent</span>';
+  if (m.status === 'failed') return `<span class="st-failed">✕ failed${m.status_reason ? ' · ' + esc(m.status_reason) : ''}</span>`;
+  if (m.status === 'no_ack') {
+    return m.direct
+      ? '<span class="st-no_ack">⧗ no ack</span>'
+      : '<span class="st-no_ack">⧗ nobody heard it</span>';
+  }
+  if (m.status === 'delivered') {
+    // Older stored acks predate RF/MQTT tagging and are plain id strings —
+    // treat those as unknown path, not RF.
+    const heard = (m.heard_by || []).map(h => typeof h === 'string' ? {id: h, via_mqtt: null} : h);
+    if (m.direct) {
+      // One recipient, so there's exactly one ack (if any landed before the
+      // record was created some other way) — just say which path it took.
+      const via = heard[0] ? heard[0].via_mqtt : null;
+      const tag = via === true ? ' via MQTT' : via === false ? ' via RF' : '';
+      return `<span class="st-delivered">✓ delivered${tag}</span>`;
+    }
+    // Broadcast acks accumulate — each relaying node reports in separately,
+    // sometimes seconds apart, so this count can keep climbing after the
+    // message first shows as heard.
+    const rf = heard.filter(h => h.via_mqtt === false).length;
+    const mqtt = heard.filter(h => h.via_mqtt === true).length;
+    const unknown = heard.length - rf - mqtt;
+    const parts = [];
+    if (rf) parts.push(`${rf} RF`);
+    if (mqtt) parts.push(`${mqtt} MQTT`);
+    if (unknown) parts.push(`${unknown} unknown path`);
+    const names = heard.map(h =>
+      nameFor(h.id) + (h.via_mqtt === true ? ' (MQTT)' : h.via_mqtt === false ? ' (RF)' : '')).join(', ');
+    return `<span class="st-delivered" title="${esc(names)}">✓ heard by ${heard.length} node${heard.length === 1 ? '' : 's'}${parts.length ? ' — ' + parts.join(', ') : ''}</span>`;
+  }
+  return '';
+}
+
+function bubbles(msgs, showSender) {
+  if (!msgs.length) return '<span class="muted">Nothing here yet</span>';
+  let lastDay = null;
+  return msgs.map(m => {
+    let out = '';
+    const dk = dayKey(m.ts);
+    if (dk !== lastDay) { out += `<div class="day">${esc(dk)}</div>`; lastDay = dk; }
+    const mine = m.from === 'me';
+    const sender = (!mine && showSender) ? `<div class="sender">${esc(nameFor(m.from))}</div>` : '';
+    const tags = m.via_mqtt ? '<span class="tag mqtt">MQTT</span>' : '';
+    out += `<div class="bubble ${mine ? 'me' : 'them'}">
+      ${sender}<div>${esc(m.text)}</div>
+      <div class="meta">${tags}<span>${fmtTime(m.ts)}</span>${statusText(m)}</div>
+    </div>`;
+    return out;
+  }).join('');
+}
+
+async function loadNodes() {
+  try {
+    const r = await fetch('/api/nodes');
+    if (!r.ok) return;
+    NODES = {};
+    (await r.json()).forEach(n => { if ((n.user || {}).id) NODES[n.user.id] = n; });
+  } catch (e) {}
+}
+async function loadChannels() {
+  try {
+    const r = await fetch('/api/channels');
+    if (r.ok) CHANNELS = await r.json();
+  } catch (e) {}
+}
+
+function render() {
+  const open = openSet();
+  const scrolls = {};
+  document.querySelectorAll('.convo').forEach(c => { scrolls[c.dataset.key] = c.scrollTop; });
+
+  // Preserve in-progress typing (and focus/caret) across the 5s poll re-render —
+  // rebuilding #feeds innerHTML otherwise wipes whatever the user was mid-typing.
+  const drafts = {};
+  let focusedId = null, selStart = null, selEnd = null;
+  document.querySelectorAll('#feeds input[type="text"]').forEach(el => {
+    if (el.value) drafts[el.id] = el.value;
+    if (document.activeElement === el) {
+      focusedId = el.id; selStart = el.selectionStart; selEnd = el.selectionEnd;
+    }
+  });
+
+  // One collapsible feed per enabled channel — a broadcast belongs to exactly
+  // one channel, so each gets its own conversation and its own send box.
+  let html = '';
+  CHANNELS.forEach((c, i) => {
+    if (i !== 0 && (c.role || 'DISABLED') === 'DISABLED') return;
+    const msgs = MSGS.filter(m => !m.direct && (m.channel || 0) === i);
+    const key = 'ch' + i;
+    html += `
+      <details class="feed" data-feed="${key}" ${open.has(key) ? 'open' : ''}>
+        <summary><strong>Ch${i}</strong> ${esc(channelLabel(i))}<span class="count">${msgs.length} message${msgs.length === 1 ? '' : 's'}</span></summary>
+        <div class="feed-body">
+          <div class="convo" data-key="${key}">${bubbles(msgs, true)}</div>
+          <div class="row">
+            <input type="text" id="send-${i}" placeholder="Broadcast on ${esc(channelLabel(i))}…" maxlength="200" style="flex:1;">
+            <button onclick="sendOn(${i})">Send</button>
+          </div>
+        </div>
+      </details>`;
+  });
+
+  // Direct messages, one sub-thread per peer.
+  const peers = new Map();
+  MSGS.forEach(m => { const p = peerOf(m); if (p) peers.set(p, Math.max(peers.get(p) || 0, m.ts)); });
+  const peerList = [...peers.entries()].sort((a, b) => b[1] - a[1]).map(e => e[0]);
+  if (ACTIVE_DM && !peerList.includes(ACTIVE_DM)) peerList.unshift(ACTIVE_DM);
+  if (!ACTIVE_DM) ACTIVE_DM = peerList[0] || null;
+  // The conversation currently on screen counts as read immediately — do this
+  // before computing badges below so its own chip/summary count reflects it.
+  markRead(ACTIVE_DM);
+  const dmMsgs = ACTIVE_DM ? MSGS.filter(m => peerOf(m) === ACTIVE_DM) : [];
+  const totalUnread = peerList.reduce((sum, p) => sum + unreadCount(p), 0);
+  html += `
+    <details class="feed" data-feed="dm" ${open.has('dm') || ACTIVE_DM ? 'open' : ''}>
+      <summary><strong>Direct</strong> messages<span class="count">${peerList.length} conversation${peerList.length === 1 ? '' : 's'}${totalUnread ? `<span class="unread-count">${totalUnread}</span>` : ''}</span></summary>
+      <div class="feed-body">
+        ${peerList.length ? `<div class="dm-chips">${peerList.map(p => {
+          const n = unreadCount(p);
+          return `<span class="chip${p === ACTIVE_DM ? ' active' : ''}${n ? ' unread' : ''}" onclick="selectDM('${esc(p)}')">${esc(nameFor(p))}${n ? `<span class="unread-count">${n}</span>` : ''}</span>`;
+        }).join('')}</div>` : ''}
+        <div class="convo" data-key="dm">${peerList.length ? bubbles(dmMsgs, false) : '<span class="muted">No direct messages yet — start one from the Dashboard map or node list.</span>'}</div>
+        ${ACTIVE_DM ? `<div class="row">
+          <input type="text" id="send-dm" placeholder="Message ${esc(nameFor(ACTIVE_DM))}…" maxlength="200" style="flex:1;">
+          <button onclick="sendDM()">Send</button>
+        </div>` : ''}
+      </div>
+    </details>`;
+
+  document.getElementById('feeds').innerHTML = html;
+  document.querySelectorAll('details.feed').forEach(d => d.addEventListener('toggle', rememberOpen));
+  document.querySelectorAll('.convo').forEach(c => {
+    c.scrollTop = (scrolls[c.dataset.key] !== undefined) ? scrolls[c.dataset.key] : c.scrollHeight;
+  });
+  CHANNELS.forEach((c, i) => {
+    const el = document.getElementById('send-' + i);
+    if (el) el.addEventListener('keydown', e => { if (e.key === 'Enter') sendOn(i); });
+  });
+  const dmEl = document.getElementById('send-dm');
+  if (dmEl) dmEl.addEventListener('keydown', e => { if (e.key === 'Enter') sendDM(); });
+
+  Object.entries(drafts).forEach(([id, val]) => {
+    const el = document.getElementById(id);
+    if (el && !el.value) el.value = val;
+  });
+  if (focusedId) {
+    const el = document.getElementById(focusedId);
+    if (el) { el.focus(); try { el.setSelectionRange(selStart, selEnd); } catch (e) {} }
+  }
+}
+
+function selectDM(p) { ACTIVE_DM = p; render(); }
+
+async function post(body, inputEl) {
+  const text = inputEl.value;
+  if (!text.trim()) return;
+  inputEl.value = '';
+  try {
+    const r = await fetch('/api/messages', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({...body, text})
+    });
+    const d = await r.json();
+    if (d.error) { toast(d.error, true); inputEl.value = text; return; }
+    refresh();
+  } catch (e) { toast('send failed', true); inputEl.value = text; }
+}
+function sendOn(i) { post({channel: i, to: ''}, document.getElementById('send-' + i)); }
+function sendDM() { post({channel: 0, to: ACTIVE_DM}, document.getElementById('send-dm')); }
+
+async function refresh() {
+  try {
+    const r = await fetch('/api/messages');
+    if (!r.ok) return;
+    MSGS = await r.json();
+    render();
+  } catch (e) {}
+}
+
+(async () => { await Promise.all([loadNodes(), loadChannels()]); await refresh(); })();
+setInterval(refresh, 5000);
+setInterval(async () => { await Promise.all([loadNodes(), loadChannels()]); }, 60000);
+{% endblock %}

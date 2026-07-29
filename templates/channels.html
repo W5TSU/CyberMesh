@@ -1,0 +1,126 @@
+{% extends "base.html" %}
+{% block title %} — Channels{% endblock %}
+{% block head %}
+<style>
+  .ch-head { display: flex; align-items: center; gap: 0.7rem; flex-wrap: wrap; }
+  .ch-role { font-size: 0.7rem; font-weight: 700; letter-spacing: 0.04em; padding: 0.1rem 0.4rem; border-radius: 4px; }
+  .ch-role.primary { background: rgba(51,224,255,0.15); color: var(--accent); }
+  .ch-role.secondary { background: rgba(51,255,153,0.15); color: var(--ok); }
+  .ch-role.disabled { background: rgba(124,148,166,0.15); color: var(--muted); }
+  details.raw summary { cursor: pointer; color: var(--muted); font-size: 0.82rem; margin-top: 0.5rem; }
+</style>
+{% endblock %}
+{% block content %}
+<div class="panel">
+  <h2>Add channel</h2>
+  <div class="row">
+    <input type="text" id="new-ch-name" placeholder="Channel name" maxlength="10" style="flex:1;">
+    <button onclick="addChannel()">Add</button>
+  </div>
+  <p class="muted" style="margin-bottom:0;">
+    Max 10 characters. Goes into the first free slot with a freshly generated random key,
+    same as <code>meshtastic --ch-add</code>. A random key means it is a <strong>private</strong>
+    channel — to join someone else's channel of the same name you need their key.
+  </p>
+</div>
+
+<div class="panel">
+  <h2>Channels</h2>
+  <div id="channel-list" class="muted">Loading…</div>
+</div>
+{% endblock %}
+{% block script %}
+function esc(s) {
+  return (s ?? '').toString().replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+let CHANNELS = [];
+
+async function loadChannels() {
+  const r = await fetch('/api/channels');
+  CHANNELS = await r.json();
+  const container = document.getElementById('channel-list');
+  container.innerHTML = CHANNELS.map((c, i) => {
+    const s = c.settings || {};
+    const role = (c.role || 'DISABLED').toLowerCase();
+    const named = s.name || (i === 0 ? '(default / LongFast)' : '(empty)');
+    const isPrimary = i === 0;
+    const enabled = role !== 'disabled';
+    // Primary can't be switched off — the node must always have one.
+    const toggle = isPrimary ? '' : `
+      <label class="switch" title="${enabled ? 'Disable' : 'Enable'} this channel">
+        <input type="checkbox" ${enabled ? 'checked' : ''} onchange="toggleChannel(${i}, this.checked)">
+        <span class="slider"></span>
+      </label>`;
+    return `
+      <div class="panel" style="margin-bottom:0.8rem;">
+        <div class="ch-head">
+          <strong>Ch ${i}</strong>
+          <span>${esc(named)}</span>
+          <span class="ch-role ${role}">${esc(c.role || 'DISABLED')}</span>
+          ${(s.uplinkEnabled || s.uplink_enabled) ? '<span class="muted">uplink</span>' : ''}
+          ${(s.downlinkEnabled || s.downlink_enabled) ? '<span class="muted">downlink</span>' : ''}
+          <span style="margin-left:auto;"></span>
+          ${toggle}
+        </div>
+        <details class="raw">
+          <summary>Raw settings (advanced)</summary>
+          <textarea id="ch-${i}" spellcheck="false">${esc(JSON.stringify(c, null, 2))}</textarea>
+          <div class="row"><button onclick="saveChannel(${i})">Save &amp; apply</button></div>
+        </details>
+      </div>`;
+  }).join('');
+}
+
+async function toggleChannel(i, enabled) {
+  try {
+    const r = await fetch(`/api/channels/${i}/enabled`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({enabled})
+    });
+    const d = await r.json();
+    if (d.error) { toast(d.error, true); }
+    else { toast(`Channel ${i} ${enabled ? 'enabled' : 'disabled'}`); }
+  } catch (e) { toast('request failed', true); }
+  setTimeout(loadChannels, 1200);
+}
+
+async function addChannel() {
+  const el = document.getElementById('new-ch-name');
+  const name = el.value.trim();
+  if (!name) return;
+  try {
+    const r = await fetch('/api/channels/add', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name})
+    });
+    const d = await r.json();
+    if (d.error) { toast(d.error, true); return; }
+    el.value = '';
+    toast(`Added '${d.name}' as channel ${d.index}`);
+  } catch (e) { toast('request failed', true); }
+  setTimeout(loadChannels, 1200);
+}
+
+async function saveChannel(i) {
+  let parsed;
+  try {
+    parsed = JSON.parse(document.getElementById('ch-' + i).value);
+  } catch (e) {
+    toast('Invalid JSON: ' + e.message, true);
+    return;
+  }
+  const r = await fetch('/api/channels/' + i, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(parsed)
+  });
+  const d = await r.json();
+  if (d.error) toast(d.error, true);
+  else toast('Channel ' + i + ' saved');
+  setTimeout(loadChannels, 1200);
+}
+loadChannels();
+{% endblock %}
