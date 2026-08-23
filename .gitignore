@@ -1,7 +1,11 @@
 .env
 messages.db
 messages.db-journal
+bbs.db
+bbs.db-journal
 __pycache__/
 *.pyc
 venv/
 .DS_Store
+*.bin
+*.log

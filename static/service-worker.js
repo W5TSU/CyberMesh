@@ -1,12 +1,15 @@
 // Bump this whenever a cached shell route/template changes, or clients keep
 // seeing stale HTML served from cache before the background refetch lands.
-const CACHE = "cybermesh-shell-v18";
+const CACHE = "cybermesh-shell-v32";
 const SHELL = [
   "/",
   "/messages",
+  "/bbs",
+  "/range",
   "/config",
   "/channels",
   "/static/leaflet/leaflet.js",
+  "/static/leaflet/leaflet-heat.js",
   "/static/leaflet/leaflet.css",
   "/static/manifest.json",
   "/static/icon-192.png",

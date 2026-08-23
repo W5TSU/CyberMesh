@@ -1,0 +1,352 @@
+{% extends "base.html" %}
+{% block title %} — Range{% endblock %}
+{% block head %}
+<link rel="stylesheet" href="/static/leaflet/leaflet.css" />
+<script src="/static/leaflet/leaflet.js"></script>
+<script src="/static/leaflet/leaflet-heat.js"></script>
+<style>
+  #range-map { height: 460px; border-radius: 10px; }
+  .leaflet-popup-content-wrapper, .leaflet-popup-tip { background: var(--panel); color: var(--text); }
+  .leaflet-container { background: #0b0f14; }
+  .leaflet-popup-content { margin: 0.7rem 0.9rem; }
+  .legend { display: flex; gap: 1.2rem; flex-wrap: wrap; margin-top: 0.7rem; font-size: 0.8rem; }
+  .legend span::before {
+    content: ""; display: inline-block; width: 10px; height: 10px;
+    border-radius: 50%; margin-right: 0.4rem; vertical-align: middle;
+  }
+  .legend .l-hi::before { background: #33ff99; }
+  .legend .l-mid::before { background: #ffcc33; }
+  .legend .l-lo::before { background: #ff3366; }
+  .legend .l-miss::before { background: transparent; border: 2px solid #ff3366; border-radius: 0; }
+  .legend .l-nofix::before { background: transparent; border: 2px solid #ffcc33; border-radius: 0; transform: rotate(45deg); }
+  .legend .l-home::before { background: var(--accent); }
+  .probe-row { display: flex; gap: 0.8rem; flex-wrap: wrap; align-items: center; margin-bottom: 0.8rem; }
+  .state-pill {
+    font-size: 0.72rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+    padding: 0.18rem 0.55rem; border-radius: 999px; border: 1px solid currentColor;
+  }
+  .state-off { color: #66707c; }
+  .state-parked { color: var(--warn); }
+  .state-probing { color: #33ff99; }
+  .stat-grid { display: flex; gap: 1.6rem; flex-wrap: wrap; margin: 0.4rem 0 0.2rem; }
+  .stat-grid div { min-width: 90px; }
+  .stat-grid .k { font-size: 0.7rem; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); }
+  .stat-grid .v { font-size: 1.35rem; font-weight: 700; }
+  .toggle { display: inline-flex; align-items: center; gap: 0.45rem; cursor: pointer; }
+  #probe-table td, #probe-table th { white-space: nowrap; }
+  .res-hit { color: #33ff99; font-weight: 700; }
+  .res-miss { color: #ff3366; font-weight: 700; }
+  .res-nofix { color: #ffcc33; font-weight: 700; }
+</style>
+{% endblock %}
+{% block content %}
+
+<div class="panel">
+  <h2>Range probe</h2>
+  <p class="muted" style="margin-top:0;">
+    Asks the tracked node for its position over the private channel on a timer. A reply is a
+    confirmed round trip home and comes back at full GPS precision; a timeout is recorded as a
+    miss — the one thing passive position logging can never tell you. A reply that carries
+    <em>no</em> fix is tracked separately: the radio path worked, so it counts as reaching home,
+    it just can't be placed on the map. Probing only runs while the node is <em>moving</em>,
+    detected from its own beacons, so a night parked at home costs nothing.
+  </p>
+  <div class="probe-row">
+    <label class="toggle"><input type="checkbox" id="probe-enabled"> <strong>Probing enabled</strong></label>
+    <span class="state-pill state-off" id="probe-state">off</span>
+    <button class="mini" onclick="probeNow()" id="probe-now-btn">Probe now</button>
+    <select id="probe-hours">
+      <option value="6">6 hours</option>
+      <option value="24" selected>24 hours</option>
+      <option value="72">3 days</option>
+      <option value="168">7 days</option>
+      <option value="">all history</option>
+    </select>
+    <label class="muted"><input type="checkbox" id="probe-heat" style="vertical-align:middle;"> heat overlay</label>
+    <span class="muted" id="probe-meta" style="margin-left:auto;"></span>
+  </div>
+  <div class="stat-grid">
+    <div><div class="k">Probes</div><div class="v" id="s-total">—</div></div>
+    <div><div class="k">Reached home</div><div class="v" id="s-rate">—</div><div class="muted" id="s-rate-note" style="font-size:0.68rem;"></div></div>
+    <div><div class="k">Median reply</div><div class="v" id="s-latency">—</div></div>
+    <div><div class="k">Best DX</div><div class="v" id="s-dx">—</div></div>
+    <div><div class="k">Direct / relayed</div><div class="v" id="s-direct">—</div></div>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Coverage</h2>
+  <div id="range-map"></div>
+  <div class="legend">
+    <span class="l-home">Home</span>
+    <span class="l-hi">Strong (SNR &ge; 5)</span>
+    <span class="l-mid">Marginal (&minus;5 to 5)</span>
+    <span class="l-lo">Weak (&lt; &minus;5)</span>
+    <span class="l-nofix">Answered, no GPS fix (diamond)</span>
+    <span class="l-miss">No reply (square, at last known position)</span>
+    <span class="muted" style="margin-left:auto;">Filled = reached home direct, hollow = relayed. Distances are from the
+      T&#8209;Beam's surveyed position (<code>RANGE_HOME_*</code>) &mdash; not its own beacon, which is fuzzed to its channel precision.</span>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Probe log</h2>
+  <table id="probe-table">
+    <thead>
+      <tr><th>Time</th><th>Result</th><th>Reply</th><th>SNR</th><th>RSSI</th><th>Path</th><th>Distance</th><th>Position</th></tr>
+    </thead>
+    <tbody><tr><td colspan="8" class="muted">Loading…</td></tr></tbody>
+  </table>
+</div>
+
+<script>
+let rmap = null, rlayer = null, rheat = null, homeMarker = null;
+let PROBE_STATUS = {};
+
+function esc(s) {
+  return String(s === null || s === undefined ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function fmtAgo(t) {
+  if (!t) return '—';
+  const s = Math.max(0, Date.now() / 1000 - t);
+  if (s < 60) return `${Math.round(s)}s ago`;
+  if (s < 3600) return `${Math.round(s / 60)}m ago`;
+  if (s < 86400) return `${(s / 3600).toFixed(1)}h ago`;
+  return `${(s / 86400).toFixed(1)}d ago`;
+}
+
+function milesBetween(a, b) {
+  const R = 3958.8, toRad = d => d * Math.PI / 180;
+  const dLat = toRad(b[0] - a[0]), dLon = toRad(b[1] - a[1]);
+  const h = Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(a[0])) * Math.cos(toRad(b[0])) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+function snrColor(snr) {
+  if (snr === null || snr === undefined) return '#8899aa';
+  if (snr >= 5) return '#33ff99';
+  if (snr >= -5) return '#ffcc33';
+  return '#ff3366';
+}
+
+function initRangeMap() {
+  rmap = L.map('range-map', {attributionControl: false}).setView([35.6, -97.54], 11);
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+    maxZoom: 19, attribution: '&copy; OpenStreetMap &copy; CARTO'
+  }).addTo(rmap);
+}
+
+function probePopup(p) {
+  const dist = (window.HOME && p.lat)
+    ? `${milesBetween([window.HOME.lat, window.HOME.lon], [p.lat, p.lon]).toFixed(2)} mi from home<br>` : '';
+  if (p.result === 'nofix') {
+    return `<b class="res-nofix">Answered &mdash; no GPS fix</b><br>` +
+      `<span class="muted">${new Date(p.ts * 1000).toLocaleString()}</span><br>` +
+      `Replied in ${p.latency ? p.latency.toFixed(1) : '?'}s<br>` +
+      `<span class="muted">The radio path worked &mdash; this is a coverage <em>success</em>. ` +
+      `The node simply had no position to report, so it's drawn at its last known one.</span>`;
+  }
+  if (p.result === 'miss') {
+    return `<b class="res-miss">No reply</b><br>` +
+      `<span class="muted">${new Date(p.ts * 1000).toLocaleString()}</span><br>` +
+      dist +
+      `<span class="muted">Plotted at the last position we had, which may be stale — ` +
+      `this marks roughly where the link failed, not exactly.</span>`;
+  }
+  const hops = p.hops_away === 0 ? 'direct — no relay'
+    : (p.hops_away ? `${p.hops_away} hop${p.hops_away > 1 ? 's' : ''}` : 'unknown');
+  const age = p.fix_age == null ? '' :
+    (p.stale_fix
+      ? `<br><span style="color:var(--warn)">Fix was ${Math.round(p.fix_age)}s old — the node may have moved since, so treat the position as approximate.</span>`
+      : `<br><span class="muted">Fix ${Math.round(p.fix_age)}s old</span>`);
+  return `<b class="res-hit">Reached home</b><br>` +
+    `<span class="muted">${new Date(p.ts * 1000).toLocaleString()}</span><br>` +
+    dist +
+    `Reply in ${p.latency ? p.latency.toFixed(1) : '?'}s<br>` +
+    `SNR ${p.snr ?? '—'} dB${p.rssi ? ` · RSSI ${p.rssi}` : ''}<br>Path: ${hops}${age}`;
+}
+
+function renderStats(probes) {
+  const hits = probes.filter(p => p.result === 'hit');
+  const nofix = probes.filter(p => p.result === 'nofix');
+  const withPos = hits.filter(p => p.lat && p.lon);
+  document.getElementById('s-total').textContent = probes.length || '—';
+  // A fixless reply still proves the radio path, so it counts toward reaching
+  // home — it just can't contribute a location. Shown separately so a run of
+  // them doesn't quietly masquerade as mapped coverage.
+  const reached = hits.length + nofix.length;
+  document.getElementById('s-rate').textContent = probes.length
+    ? `${Math.round(100 * reached / probes.length)}%` : '—';
+  document.getElementById('s-rate-note').textContent = nofix.length
+    ? `${nofix.length} of those had no GPS fix` : '';
+
+  const lat = hits.map(p => p.latency).filter(v => v != null).sort((a, b) => a - b);
+  document.getElementById('s-latency').textContent = lat.length
+    ? `${lat[Math.floor(lat.length / 2)].toFixed(1)}s` : '—';
+
+  let dx = 0;
+  if (window.HOME) {
+    withPos.forEach(p => {
+      dx = Math.max(dx, milesBetween([window.HOME.lat, window.HOME.lon], [p.lat, p.lon]));
+    });
+  }
+  document.getElementById('s-dx').textContent = dx ? `${dx.toFixed(1)} mi` : '—';
+
+  const direct = hits.filter(p => p.hops_away === 0).length;
+  const relayed = hits.filter(p => p.hops_away > 0).length;
+  document.getElementById('s-direct').textContent = hits.length ? `${direct} / ${relayed}` : '—';
+}
+
+function renderProbes(probes) {
+  if (rlayer) { rmap.removeLayer(rlayer); rlayer = null; }
+  if (rheat) { rmap.removeLayer(rheat); rheat = null; }
+
+  const layers = [];
+  const bounds = [];
+  if (window.HOME) {
+    bounds.push([window.HOME.lat, window.HOME.lon]);
+    layers.push(L.circleMarker([window.HOME.lat, window.HOME.lon], {
+      radius: 7, color: '#33e0ff', weight: 3, fillColor: '#33e0ff', fillOpacity: 0.9,
+    }).bindPopup('<b>Home</b><br>CyberMesh base station (T-Beam)<br>' +
+      `<span class="muted">${window.HOME.lat.toFixed(6)}, ${window.HOME.lon.toFixed(6)}</span>`));
+  }
+
+  probes.forEach(p => {
+    if (!p.lat || !p.lon) return;
+    bounds.push([p.lat, p.lon]);
+    if (p.result === 'miss' || p.result === 'nofix') {
+      // Square/diamond, hollow, deliberately distinct from a measured point:
+      // this position is inherited from the last successful contact, not
+      // measured by this probe. Amber (not red) for nofix, because the link
+      // itself worked — only the GPS was cold.
+      const c = p.result === 'nofix' ? '#ffcc33' : '#ff3366';
+      const rot = p.result === 'nofix' ? 'transform:rotate(45deg);' : '';
+      layers.push(L.marker([p.lat, p.lon], {
+        icon: L.divIcon({
+          className: '',
+          html: `<div style="width:11px;height:11px;border:2px solid ${c};background:${c}26;${rot}"></div>`,
+          iconSize: [11, 11], iconAnchor: [5, 5],
+        }),
+      }).bindPopup(probePopup(p)));
+      return;
+    }
+    const relayed = p.hops_away > 0;
+    layers.push(L.circleMarker([p.lat, p.lon], {
+      radius: 6, color: snrColor(p.snr), weight: 2,
+      // Dashed = the fix predates the probe enough that the node may have
+      // moved; the link is proven, the location isn't.
+      dashArray: p.stale_fix ? '3,3' : null,
+      fillColor: snrColor(p.snr), fillOpacity: relayed ? 0.1 : 0.85,
+    }).bindPopup(probePopup(p)));
+  });
+
+  rlayer = L.layerGroup(layers).addTo(rmap);
+
+  if (document.getElementById('probe-heat').checked) {
+    const hits = probes.filter(p => p.result === 'hit' && p.lat && p.lon);
+    if (hits.length) {
+      rheat = L.heatLayer(hits.map(p => {
+        const snr = p.snr == null ? -5 : p.snr;
+        return [p.lat, p.lon, Math.min(1, Math.max(0.15, (snr + 20) / 32))];
+      }), {radius: 24, blur: 18, maxZoom: 15}).addTo(rmap);
+    }
+  }
+
+  if (bounds.length > 1 && !window.RANGE_FIT_DONE) {
+    rmap.fitBounds(bounds, {maxZoom: 14, padding: [30, 30]});
+    window.RANGE_FIT_DONE = true;
+  }
+
+  const tbody = document.querySelector('#probe-table tbody');
+  if (!probes.length) {
+    tbody.innerHTML = '<tr><td colspan="8" class="muted">No probes yet — enable probing, or hit “Probe now”.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = [...probes].reverse().slice(0, 200).map(p => {
+    const dist = (window.HOME && p.lat)
+      ? milesBetween([window.HOME.lat, window.HOME.lon], [p.lat, p.lon]).toFixed(2) + ' mi' : '—';
+    const hops = p.result !== 'hit' ? '—'
+      : (p.hops_away === 0 ? 'direct' : (p.hops_away ? `${p.hops_away} hop` : '?'));
+    return `<tr>
+      <td title="${esc(new Date(p.ts * 1000).toLocaleString())}">${esc(fmtAgo(p.ts))}</td>
+      <td class="res-${p.result === 'hit' ? 'hit' : (p.result === 'nofix' ? 'nofix' : 'miss')}">${
+        p.result === 'hit' ? 'reached' : (p.result === 'nofix' ? 'reached, no fix' : 'no reply')}</td>
+      <td>${p.latency ? p.latency.toFixed(1) + 's' : '—'}</td>
+      <td>${p.snr ?? '—'}</td>
+      <td>${p.rssi ?? '—'}</td>
+      <td>${esc(hops)}</td>
+      <td>${esc(dist)}</td>
+      <td class="muted">${p.result !== 'hit' ? 'last known'
+        : (p.fix_age == null ? 'measured' : `fix ${Math.round(p.fix_age)}s old`)}${
+        p.stale_fix && p.result === 'hit' ? ' ⚠' : ''}</td>
+    </tr>`;
+  }).join('');
+}
+
+function renderStatus(st) {
+  PROBE_STATUS = st || {};
+  const pill = document.getElementById('probe-state');
+  const state = st.state || 'off';
+  pill.className = 'state-pill state-' + (state === 'unconfigured' ? 'off' : state);
+  pill.textContent = state === 'parked' ? 'parked — waiting for movement' : state;
+  document.getElementById('probe-enabled').checked = !!st.enabled;
+  document.getElementById('probe-enabled').disabled = state === 'unconfigured';
+
+  if (state === 'unconfigured') {
+    document.getElementById('probe-meta').textContent =
+      'Set RANGE_PROBE_NODE in .env and restart to enable.';
+    return;
+  }
+  const bits = [`${esc(st.node_id)} · ch${st.channel}`];
+  if (st.last_poll) bits.push(`last probe ${fmtAgo(st.last_poll)} (${esc(st.last_result || '?')})`);
+  if (st.next_poll) bits.push(`next in ${Math.max(0, Math.round(st.next_poll - Date.now() / 1000))}s`);
+  else if (st.enabled) bits.push(`every ${st.poll_secs}s while moving`);
+  if (st.consecutive_misses > 1) bits.push(`${st.consecutive_misses} misses in a row`);
+  document.getElementById('probe-meta').textContent = bits.join(' · ');
+}
+
+async function refreshRange() {
+  const hours = document.getElementById('probe-hours').value;
+  try {
+    const r = await fetch('/api/range/probes' + (hours ? `?hours=${hours}` : ''));
+    if (!r.ok) return;
+    const d = await r.json();
+    if (d.home) window.HOME = d.home;
+    if (d.status) renderStatus(d.status);
+    renderProbes(d.probes || []);
+    renderStats(d.probes || []);
+  } catch (e) { /* transient */ }
+}
+
+async function setEnabled(on) {
+  const r = await fetch('/api/range/enable', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({enabled: on}),
+  });
+  if (r.ok) renderStatus(await r.json());
+}
+
+async function probeNow() {
+  const btn = document.getElementById('probe-now-btn');
+  btn.disabled = true; btn.textContent = 'Probing…';
+  try {
+    await fetch('/api/range/probe-now', {method: 'POST'});
+    // The probe waits for a reply server-side, so give it room before redrawing.
+    setTimeout(() => { refreshRange(); btn.disabled = false; btn.textContent = 'Probe now'; }, 12000);
+  } catch (e) {
+    btn.disabled = false; btn.textContent = 'Probe now';
+  }
+}
+
+document.getElementById('probe-enabled').addEventListener('change', e => setEnabled(e.target.checked));
+document.getElementById('probe-hours').addEventListener('change', refreshRange);
+document.getElementById('probe-heat').addEventListener('change', refreshRange);
+
+initRangeMap();
+refreshRange();
+setInterval(refreshRange, 20000);
+</script>
+{% endblock %}

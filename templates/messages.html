@@ -24,9 +24,14 @@
   .st-delivered { color: var(--ok); }
   .st-failed { color: var(--accent2); font-weight: 600; }
   .st-no_ack { color: var(--warn); }
+  .st-relayed { color: #b088ff; }
   .st-sending { color: var(--muted); }
   .tag { font-size: 0.64rem; font-weight: 700; letter-spacing: 0.04em; padding: 0.02rem 0.3rem; border-radius: 4px; }
   .tag.mqtt { background: rgba(255,204,51,0.15); color: var(--warn); }
+  .tag.rf { background: rgba(51,224,255,0.1); color: var(--accent); }
+  .tag.direct { background: rgba(51,255,153,0.12); color: var(--ok); }
+  .rf-meta { font-size: 0.64rem; color: var(--muted); opacity: 0.95; }
+  .bubble .meta { flex-wrap: wrap; row-gap: 0.15rem; }
   .day { align-self: center; font-size: 0.7rem; color: var(--muted); margin: 0.4rem 0 0.1rem; }
   .dm-chips { display: flex; gap: 0.4rem; flex-wrap: wrap; margin-bottom: 0.6rem; }
   .chip { background: #0e151c; border: 1px solid var(--border); color: var(--muted); border-radius: 999px; padding: 0.25rem 0.7rem; font-size: 0.8rem; cursor: pointer; display: inline-flex; align-items: center; gap: 0.35rem; }
@@ -37,11 +42,28 @@
     min-width: 1.15rem; height: 1.15rem; padding: 0 0.3rem; border-radius: 999px;
     background: var(--accent2); color: #0b0e12; font-size: 0.68rem; font-weight: 700;
   }
+  .reactions { margin-top: 0.28rem; display: flex; flex-wrap: wrap; gap: 0.25rem; }
+  .reaction-pill { font-size: 0.72rem; border: 1px solid rgba(51,224,255,0.35); background: rgba(51,224,255,0.09); border-radius: 999px; padding: 0.05rem 0.32rem; }
+  .bubble[data-pkt] { cursor: default; -webkit-user-select: none; user-select: none; }
+  .bubble.pressing { outline: 1px solid rgba(51,224,255,0.6); box-shadow: 0 0 18px rgba(51,224,255,0.18); }
+  .tapback-picker {
+    position: fixed; z-index: 1000; display: none; gap: 0.25rem; align-items: center;
+    padding: 0.35rem; border: 1px solid rgba(51,224,255,0.45); border-radius: 999px;
+    background: rgba(11,14,18,0.96); box-shadow: 0 8px 28px rgba(0,0,0,0.45), 0 0 24px rgba(51,224,255,0.16);
+    backdrop-filter: blur(8px);
+  }
+  .tapback-picker.open { display: flex; }
+  .tapback-picker button {
+    width: 2rem; height: 2rem; border: 0; border-radius: 999px; background: transparent;
+    font-size: 1.18rem; cursor: pointer; transition: transform 0.08s, background 0.08s;
+  }
+  .tapback-picker button:hover { background: rgba(255,255,255,0.08); transform: translateY(-1px) scale(1.08); }
   summary .unread-count { margin-left: 0.35rem; }
 </style>
 {% endblock %}
 {% block content %}
 <div id="feeds"></div>
+<div id="tapback-picker" class="tapback-picker" role="menu" aria-label="Tapback picker"></div>
 {% endblock %}
 {% block script %}
 function esc(s) {
@@ -51,9 +73,48 @@ function esc(s) {
 function fmtTime(ts) { return new Date(ts * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}); }
 function dayKey(ts) { return new Date(ts * 1000).toDateString(); }
 
+function messageKey(m) {
+  if (m?.id != null) return `id:${m.id}`;
+  return `ts:${m?.ts ?? 0}:${m?.from ?? ''}:${m?.to ?? ''}:${m?.text ?? ''}`;
+}
+
+function recomputeLastTs() {
+  LAST_TS = MSGS.reduce((cursor, m) => Math.max(cursor, Number(m?.ts || 0), Number(m?.updated_ts || 0)), 0);
+}
+
+function mergeMessages(changes) {
+  if (!changes?.length) return false;
+  const byKey = new Map(MSGS.map((m, idx) => [messageKey(m), idx]));
+  let changed = false;
+  changes.forEach(msg => {
+    const key = messageKey(msg);
+    const idx = byKey.get(key);
+    if (idx === undefined) {
+      MSGS.push(msg);
+      byKey.set(key, MSGS.length - 1);
+      changed = true;
+      return;
+    }
+    const before = JSON.stringify(MSGS[idx]);
+    const after = JSON.stringify(msg);
+    if (before !== after) {
+      MSGS[idx] = msg;
+      changed = true;
+    }
+  });
+  if (changed) {
+    MSGS.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+    recomputeLastTs();
+  }
+  return changed;
+}
+
 const BROADCAST = '^all';
 const OPEN_KEY = 'cybermesh.openfeeds';
-let NODES = {}, CHANNELS = [], MSGS = [];
+const TAPBACKS = ['👍','❤️','😂','😮','😢','👎'];
+let NODES = {}, CHANNELS = [], MSGS = [], NAME_MAP = {};
+let LAST_TS = 0;
+let HAS_FULL_LOAD = false;
 let ACTIVE_DM = new URLSearchParams(location.search).get('to') || null;
 
 // Per-peer "last read" timestamp, so a DM chip can show an unread badge —
@@ -97,8 +158,15 @@ function rememberOpen() {
 
 function nameFor(id) {
   if (!id || id === BROADCAST) return 'Broadcast';
+  // First check the durable name map from the server (survives restarts)
+  if (NAME_MAP[id]) return NAME_MAP[id];
+  // Next check the live mesh node list
   const u = (NODES[id] || {}).user || {};
-  return ((u.shortName ? u.shortName + ' ' : '') + (u.longName || id)).trim();
+  if (u.longName) return (u.shortName ? u.shortName + ' ' : '') + u.longName;
+  // Finally check from_name in our message history
+  const msg = MSGS.find(m => m.from === id && m.from_name);
+  if (msg && msg.from_name) return msg.from_name;
+  return id;
 }
 function channelLabel(i) {
   const c = CHANNELS[i];
@@ -111,27 +179,44 @@ function peerOf(m) { return m.direct ? (m.from === 'me' ? m.to : m.from) : null;
 function statusText(m) {
   if (m.from !== 'me') return '';
   if (m.status === 'sending') return '<span class="st-sending">sending…</span>';
-  if (m.status === 'sent') return '<span class="st-sending">sent</span>';
+  if (m.status === 'sent') {
+    return m.direct
+      ? '<span class="st-sending">sent</span>'
+      : '<span class="st-delivered" title="Handed to radio (no hop-ack requested)">✓ sent</span>';
+  }
   if (m.status === 'failed') return `<span class="st-failed">✕ failed${m.status_reason ? ' · ' + esc(m.status_reason) : ''}</span>`;
   if (m.status === 'no_ack') {
-    return m.direct
-      ? '<span class="st-no_ack">⧗ no ack</span>'
-      : '<span class="st-no_ack">⧗ nobody heard it</span>';
+    if (m.direct) return '<span class="st-no_ack">⧗ no ack</span>';
+    // Broadcast: empty heard_by usually means "no node rebroadcast/acked",
+    // not "nobody received the text" (CLIENT_MUTE / phones don't hop-ack).
+    const why = (m.status_reason || '').toUpperCase();
+    if (why.includes('MAX_RETRANSMIT')) {
+      return '<span class="st-no_ack" title="Radio gave up on hop retransmits — neighbors may still have received the text">⧗ no relay ack</span>';
+    }
+    return '<span class="st-no_ack" title="No rebroadcast acks came back — the packet may still have been received">⧗ no relay ack</span>';
+  }
+  // "acknowledged" means a DM reached an intermediate node but not the
+  // final destination — still useful: someone on the mesh heard it.
+  if (m.status === 'relayed') {
+    const heard = (m.heard_by || []).map(h => typeof h === 'string' ? {id: h, via_mqtt: null} : h);
+    const names = heard.map(h =>
+      nameFor(h.id) + (h.via_mqtt === true ? ' (MQTT)' : h.via_mqtt === false ? ' (RF)' : '')).join(', ');
+    return `<span class="st-relayed" title="${esc(names)}">✓ acknowledged by ${esc(names)}</span>`;
   }
   if (m.status === 'delivered') {
     // Older stored acks predate RF/MQTT tagging and are plain id strings —
     // treat those as unknown path, not RF.
     const heard = (m.heard_by || []).map(h => typeof h === 'string' ? {id: h, via_mqtt: null} : h);
     if (m.direct) {
-      // One recipient, so there's exactly one ack (if any landed before the
-      // record was created some other way) — just say which path it took.
-      const via = heard[0] ? heard[0].via_mqtt : null;
-      const tag = via === true ? ' via MQTT' : via === false ? ' via RF' : '';
+      // Find the actual destination's ack in the heard_by list
+      const dest = heard.find(h => h.is_destination) || heard[0];
+      const tag = dest
+        ? (dest.via_mqtt === true ? ' via MQTT' : dest.via_mqtt === false ? ' via RF' : '')
+        : '';
       return `<span class="st-delivered">✓ delivered${tag}</span>`;
     }
-    // Broadcast acks accumulate — each relaying node reports in separately,
-    // sometimes seconds apart, so this count can keep climbing after the
-    // message first shows as heard.
+    // Broadcast hop-acks accumulate from rebroadcasting nodes only.
+    // CLIENT_MUTE / phone receivers never appear here even if they saw the text.
     const rf = heard.filter(h => h.via_mqtt === false).length;
     const mqtt = heard.filter(h => h.via_mqtt === true).length;
     const unknown = heard.length - rf - mqtt;
@@ -141,9 +226,47 @@ function statusText(m) {
     if (unknown) parts.push(`${unknown} unknown path`);
     const names = heard.map(h =>
       nameFor(h.id) + (h.via_mqtt === true ? ' (MQTT)' : h.via_mqtt === false ? ' (RF)' : '')).join(', ');
-    return `<span class="st-delivered" title="${esc(names)}">✓ heard by ${heard.length} node${heard.length === 1 ? '' : 's'}${parts.length ? ' — ' + parts.join(', ') : ''}</span>`;
+    const tip = (names ? names + ' — ' : '')
+      + 'hop-layer relay acks only; pure receivers (CLIENT_MUTE / phones) do not appear';
+    return `<span class="st-delivered" title="${esc(tip)}">✓ relay ack ×${heard.length}${parts.length ? ' — ' + parts.join(', ') : ''}</span>`;
   }
   return '';
+}
+
+function reactionHtml(m) {
+  const reactions = m.reactions || [];
+  if (!reactions.length) return '';
+  return `<div class="reactions">${reactions.map(r =>
+    `<span class="reaction-pill" title="${esc(nameFor(r.from))}">${esc(r.emoji)}</span>`
+  ).join('')}</div>`;
+}
+
+/** Last-hop RF meta for *received* packets (outbound usually has none). */
+function rfMetaHtml(m) {
+  if (m.from === 'me') return '';
+  const parts = [];
+  let hopTag = '';
+  if (m.hops_away === 0) {
+    hopTag = '<span class="tag direct" title="Heard direct — hopStart − hopLimit = 0">direct</span>';
+  } else if (m.hops_away != null && m.hops_away !== undefined) {
+    const h = Number(m.hops_away);
+    hopTag = `<span class="tag rf" title="hopStart − hopLimit">${h} hop${h === 1 ? '' : 's'}</span>`;
+  }
+  if (m.snr != null && m.snr !== undefined && !Number.isNaN(Number(m.snr))) {
+    const s = Number(m.snr);
+    parts.push(`SNR ${s >= 0 ? '+' : ''}${s.toFixed(1)} dB`);
+  }
+  if (m.rssi != null && m.rssi !== undefined && !Number.isNaN(Number(m.rssi))) {
+    parts.push(`${Number(m.rssi).toFixed(0)} dBm`);
+  }
+  if (m.relay_node) {
+    parts.push(`via ${nameFor(m.relay_node)}`);
+  }
+  if (!hopTag && !parts.length) return '';
+  const detail = parts.length
+    ? `<span class="rf-meta" title="Last-hop RF quality — not a full multi-hop route. Use Traceroute for path maps.">${esc(parts.join(' · '))}</span>`
+    : '';
+  return `${hopTag}${detail}`;
 }
 
 function bubbles(msgs, showSender) {
@@ -156,9 +279,9 @@ function bubbles(msgs, showSender) {
     const mine = m.from === 'me';
     const sender = (!mine && showSender) ? `<div class="sender">${esc(nameFor(m.from))}</div>` : '';
     const tags = m.via_mqtt ? '<span class="tag mqtt">MQTT</span>' : '';
-    out += `<div class="bubble ${mine ? 'me' : 'them'}">
-      ${sender}<div>${esc(m.text)}</div>
-      <div class="meta">${tags}<span>${fmtTime(m.ts)}</span>${statusText(m)}</div>
+    out += `<div class="bubble ${mine ? 'me' : 'them'}" ${m.id ? `data-pkt="${m.id}"` : ''} title="Press and hold for tapback">
+      ${sender}<div>${esc(m.text)}</div>${reactionHtml(m)}
+      <div class="meta">${tags}${rfMetaHtml(m)}<span>${fmtTime(m.ts)}</span>${statusText(m)}</div>
     </div>`;
     return out;
   }).join('');
@@ -244,6 +367,7 @@ function render() {
 
   document.getElementById('feeds').innerHTML = html;
   document.querySelectorAll('details.feed').forEach(d => d.addEventListener('toggle', rememberOpen));
+  setupTapbackHandlers();
   document.querySelectorAll('.convo').forEach(c => {
     c.scrollTop = (scrolls[c.dataset.key] !== undefined) ? scrolls[c.dataset.key] : c.scrollHeight;
   });
@@ -266,6 +390,91 @@ function render() {
 
 function selectDM(p) { ACTIVE_DM = p; render(); }
 
+let tapbackTarget = null;
+let longPressTimer = null;
+let pressStart = null;
+
+function hideTapbackPicker() {
+  const picker = document.getElementById('tapback-picker');
+  if (picker) picker.classList.remove('open');
+  document.querySelectorAll('.bubble.pressing').forEach(b => b.classList.remove('pressing'));
+  tapbackTarget = null;
+}
+
+function showTapbackPicker(bubble, x, y) {
+  const pktId = bubble.dataset.pkt;
+  if (!pktId) return;
+  const picker = document.getElementById('tapback-picker');
+  tapbackTarget = pktId;
+  picker.replaceChildren(...TAPBACKS.map(e => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.dataset.emoji = e;
+    btn.title = `React ${e}`;
+    btn.textContent = e;
+    btn.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      const emoji = btn.dataset.emoji;
+      const target = tapbackTarget;
+      hideTapbackPicker();
+      await reactTo(target, emoji);
+    });
+    return btn;
+  }));
+  picker.classList.add('open');
+  const rect = picker.getBoundingClientRect();
+  const left = Math.min(Math.max(8, x - rect.width / 2), window.innerWidth - rect.width - 8);
+  const top = Math.min(Math.max(8, y - rect.height - 12), window.innerHeight - rect.height - 8);
+  picker.style.left = `${left}px`;
+  picker.style.top = `${top}px`;
+}
+
+function setupTapbackHandlers() {
+  document.querySelectorAll('.bubble[data-pkt]').forEach(bubble => {
+    bubble.addEventListener('pointerdown', e => {
+      if (e.target.closest('button,input')) return;
+      hideTapbackPicker();
+      pressStart = {x: e.clientX, y: e.clientY, bubble};
+      bubble.classList.add('pressing');
+      longPressTimer = setTimeout(() => showTapbackPicker(bubble, e.clientX, e.clientY), 450);
+    });
+    bubble.addEventListener('pointermove', e => {
+      if (!pressStart || pressStart.bubble !== bubble) return;
+      if (Math.hypot(e.clientX - pressStart.x, e.clientY - pressStart.y) > 10) {
+        clearTimeout(longPressTimer);
+        bubble.classList.remove('pressing');
+      }
+    });
+    ['pointerup', 'pointercancel', 'pointerleave'].forEach(evt => bubble.addEventListener(evt, () => {
+      clearTimeout(longPressTimer);
+      if (!document.getElementById('tapback-picker')?.classList.contains('open')) bubble.classList.remove('pressing');
+    }));
+    bubble.addEventListener('contextmenu', e => {
+      e.preventDefault();
+      hideTapbackPicker();
+      bubble.classList.add('pressing');
+      showTapbackPicker(bubble, e.clientX, e.clientY);
+    });
+  });
+}
+
+document.addEventListener('click', e => {
+  if (!e.target.closest('#tapback-picker') && !e.target.closest('.bubble[data-pkt]')) hideTapbackPicker();
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape') hideTapbackPicker(); });
+
+async function reactTo(pktId, emoji) {
+  try {
+    const r = await fetch(`/api/messages/${pktId}/reaction`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({emoji})
+    });
+    const d = await r.json();
+    if (d.error) { toast(d.error, true); return; }
+    refresh();
+  } catch (e) { toast('tapback failed', true); }
+}
+
 async function post(body, inputEl) {
   const text = inputEl.value;
   if (!text.trim()) return;
@@ -285,10 +494,21 @@ function sendDM() { post({channel: 0, to: ACTIVE_DM}, document.getElementById('s
 
 async function refresh() {
   try {
-    const r = await fetch('/api/messages');
+    const url = HAS_FULL_LOAD ? `/api/messages/since/${LAST_TS}` : '/api/messages';
+    const r = await fetch(url);
     if (!r.ok) return;
-    MSGS = await r.json();
-    render();
+    const data = await r.json();
+    if (data.name_map) NAME_MAP = data.name_map;
+    if (!HAS_FULL_LOAD) {
+      MSGS = data.messages || data;
+      HAS_FULL_LOAD = true;
+      recomputeLastTs();
+      render();
+      return;
+    }
+
+    const changed = mergeMessages([...(data.updates || []), ...(data.new || [])]);
+    if (changed) render();
   } catch (e) {}
 }
 

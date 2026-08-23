@@ -3,6 +3,7 @@
 {% block head %}
 <link rel="stylesheet" href="/static/leaflet/leaflet.css" />
 <script src="/static/leaflet/leaflet.js"></script>
+<script src="/static/leaflet/leaflet-heat.js"></script>
 <style>
   #map { height: 420px; border-radius: 10px; }
   .leaflet-popup-content-wrapper, .leaflet-popup-tip { background: var(--panel); color: var(--text); }
@@ -28,6 +29,16 @@
   .legend .l-self::before { background: var(--accent); }
   .legend .l-rf::before { background: var(--accent2); }
   .legend .l-mqtt::before { background: var(--warn); }
+  /* Coverage trail — SNR buckets. Same colours the popup and legend use, kept
+     here rather than inline so the two can't drift apart. */
+  .legend .l-snr-hi::before { background: #33ff99; }
+  .legend .l-snr-mid::before { background: #ffcc33; }
+  .legend .l-snr-lo::before { background: #ff3366; }
+  .legend .l-relayed::before { background: transparent; border: 2px solid #33e0ff; width: 8px; height: 8px; }
+  #trail-controls { display: flex; gap: 0.6rem; flex-wrap: wrap; align-items: center; margin-bottom: 0.6rem; }
+  #trail-controls select, #trail-controls button { font-size: 0.8rem; }
+  #trail-summary { font-size: 0.78rem; }
+  .trail-popup b { color: var(--accent); }
   .src { font-size: 0.7rem; font-weight: 700; letter-spacing: 0.04em; }
   .src.rf { color: var(--accent2); }
   .src.mqtt { color: var(--warn); }
@@ -70,6 +81,17 @@
   #notes-box { width: min(520px, 100%); }
   #notes-text { width: 100%; min-height: 80px; margin: 0.5rem 0; }
   #notes-saved-list { max-height: 220px; overflow-y: auto; margin-top: 0.4rem; }
+  .admin-warn {
+    border: 1px solid var(--accent2); background: rgba(255,51,136,0.08);
+    border-radius: 8px; padding: 0.7rem; margin: 0.7rem 0; color: var(--text);
+  }
+  .admin-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; margin: 0.6rem 0; }
+  .admin-grid label { display: block; font-size: 0.78rem; color: var(--muted); margin-bottom: 0.2rem; }
+  .admin-grid select, .admin-grid input { width: 100%; }
+  #remote-admin-box { width: min(760px, 100%); max-height: 92vh; overflow-y: auto; }
+  #remote-admin-json { width: 100%; min-height: 180px; margin: 0.5rem 0; }
+  #remote-admin-output { white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 0.78rem; max-height: 180px; overflow-y: auto; }
+  .preset-pill { margin: 0.15rem 0.2rem 0.15rem 0; }
   .saved-trace {
     padding: 0.4rem 0; border-bottom: 1px solid var(--border); font-size: 0.82rem;
   }
@@ -125,6 +147,7 @@
   .stat-hero .stat-qualifier.warn { color: var(--warn); }
   .stat-hero .stat-qualifier.danger { color: var(--accent2); }
   .stat-hero .stat-sub { color: var(--muted); font-size: 0.8rem; margin-left: auto; }
+
 </style>
 {% endblock %}
 {% block content %}
@@ -141,11 +164,40 @@
 
 <div class="panel">
   <h2>Map</h2>
+  <div id="trail-controls">
+    <label class="muted" for="trail-node">Coverage trail</label>
+    <select id="trail-node">
+      <option value="">off</option>
+    </select>
+    <select id="trail-hours">
+      <option value="6">6 hours</option>
+      <option value="24" selected>24 hours</option>
+      <option value="72">3 days</option>
+      <option value="168">7 days</option>
+      <option value="">all history</option>
+    </select>
+    <select id="trail-mode">
+      <option value="both" selected>heat + points</option>
+      <option value="heat">heat only</option>
+      <option value="points">points only</option>
+    </select>
+    <select id="trail-precision" title="Coarse positions are the sender fuzzing its own location per-channel — they plot kilometres from where the packet was really sent.">
+      <option value="">any precision</option>
+      <option value="16">≥ 16 bits</option>
+      <option value="32">full precision only</option>
+    </select>
+    <label class="muted" title="MQTT-delivered positions came in over the internet, not the radio — they say nothing about RF coverage."><input type="checkbox" id="trail-rf-only" checked style="vertical-align:middle;"> RF only</label>
+    <span class="muted" id="trail-summary" style="margin-left:auto;"></span>
+  </div>
   <div id="map"></div>
   <div class="legend">
     <span class="l-self">This node</span>
     <span class="l-rf">Heard over RF</span>
     <span class="l-mqtt">Via MQTT</span>
+    <span class="l-snr-hi">Trail: strong (SNR ≥ 5)</span>
+    <span class="l-snr-mid">marginal (−5 to 5)</span>
+    <span class="l-snr-lo">weak (&lt; −5)</span>
+    <span class="l-relayed">hollow = relayed, filled = direct</span>
     <span class="muted" style="margin-left:auto;">Marker shows the station&#39;s short name / emoji. Click a marker for actions.</span>
   </div>
 </div>
@@ -166,6 +218,7 @@
     </select>
     <label class="muted"><input type="checkbox" id="show-nopos" checked style="vertical-align:middle;"> include nodes with no position</label>
     <label class="muted"><input type="checkbox" id="fav-only" style="vertical-align:middle;"> favorites only</label>
+    <button class="mini" style="margin-left:auto;" onclick="pingFleet()" id="ping-fleet-btn">⚡ Ping fleet</button>
     <label class="muted" for="heard-filter">Heard within</label>
     <select id="heard-filter">
       <option value="">any time</option>
@@ -251,14 +304,73 @@
   </div>
 </div>
 
+<div id="remote-admin-backdrop" class="dm-backdrop-like" onclick="if(event.target===this) closeRemoteAdmin()" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.65); z-index:1000; align-items:center; justify-content:center; padding:1rem;">
+  <div id="remote-admin-box" class="panel" style="margin-bottom:0;">
+    <h3 id="remote-admin-title" style="margin:0 0 0.2rem; font-size:1rem; color:var(--accent2);">Remote Admin</h3>
+    <div class="muted" id="remote-admin-sub"></div>
+    <div class="admin-warn">
+      <strong>Remote config over LoRa can break the target node.</strong>
+      Read is safe-ish. Set/reboot/shutdown/factory reset are not. For writes and destructive actions, type the exact node ID below. Yes, this is the little velvet rope before the wood chipper.
+    </div>
+    <div class="admin-grid">
+      <div>
+        <label for="remote-admin-kind">Config group</label>
+        <select id="remote-admin-kind" onchange="populateRemoteSections()">
+          <option value="config">config</option>
+          <option value="module_config">module_config</option>
+        </select>
+      </div>
+      <div>
+        <label for="remote-admin-section">Section</label>
+        <select id="remote-admin-section"></select>
+      </div>
+      <div>
+        <label for="remote-admin-confirm">Confirm writes/actions by typing node ID</label>
+        <input type="text" id="remote-admin-confirm" placeholder="!38f11130">
+      </div>
+      <div>
+        <label for="remote-admin-secs">Delay seconds for reboot/shutdown</label>
+        <input type="number" id="remote-admin-secs" value="10" min="0" max="3600">
+      </div>
+    </div>
+    <div class="row">
+      <button onclick="remoteGetSection()">Read section</button>
+      <button class="danger" onclick="remoteSetSection()">Write JSON to node</button>
+      <button onclick="remoteAction('metadata')">Device metadata</button>
+      <button class="danger" onclick="remoteAction('reboot')">Reboot</button>
+      <button class="danger" onclick="remoteAction('shutdown')">Shutdown</button>
+      <button class="danger" onclick="remoteAction('reset_nodedb')">Reset NodeDB</button>
+      <button class="danger" onclick="remoteAction('factory_reset_config')">Factory reset config</button>
+      <button class="danger" onclick="remoteAction('factory_reset_full')">FULL factory reset</button>
+    </div>
+    <div style="margin-top:0.8rem;">
+      <div class="muted" style="margin-bottom:0.25rem;">Presets fill the JSON box; they do not transmit until you click Write.</div>
+      <button class="mini preset-pill" onclick="remotePreset({device:{role:'CLIENT_MUTE'}}, 'config', 'device')">role CLIENT_MUTE</button>
+      <button class="mini preset-pill" onclick="remotePreset({device:{role:'CLIENT'}}, 'config', 'device')">role CLIENT</button>
+      <button class="mini preset-pill" onclick="remotePreset({device:{node_info_broadcast_secs:10800}}, 'config', 'device')">node info 3h</button>
+      <button class="mini preset-pill" onclick="remotePreset({position:{position_broadcast_secs:3600}}, 'config', 'position')">position 1h</button>
+      <button class="mini preset-pill" onclick="remotePreset({lora:{hop_limit:3}}, 'config', 'lora')">hop limit 3</button>
+      <button class="mini preset-pill" onclick="remotePreset({telemetry:{device_update_interval:1800}}, 'module_config', 'telemetry')">telemetry 30m</button>
+    </div>
+    <textarea id="remote-admin-json" spellcheck="false" placeholder='{"device":{"role":"CLIENT_MUTE"}}'></textarea>
+    <div class="panel" style="margin:0.4rem 0; padding:0.7rem;">
+      <div class="muted" style="margin-bottom:0.25rem;">Result / recent remote-admin log</div>
+      <div id="remote-admin-output" class="muted">No remote admin command run in this browser session yet.</div>
+    </div>
+    <div class="row">
+      <button style="margin-left:auto;" onclick="closeRemoteAdmin()">Close</button>
+    </div>
+  </div>
+</div>
+
 <div class="panel">
-  <h2>Admin</h2>
+  <h2>Gateway Admin</h2>
   <div class="row">
     <button onclick="adminAction('reboot')">Reboot node</button>
     <button class="danger" onclick="adminAction('shutdown')">Shutdown node</button>
     <button class="danger" onclick="adminAction('factory_reset')">Factory reset</button>
   </div>
-  <p class="muted">These act on the node directly — same as the option in the phone app.</p>
+  <p class="muted">These act on the USB gateway node itself, not a remote node. Remote node admin is available from each node row/map popup.</p>
 </div>
 
 <div id="dm-backdrop" onclick="if(event.target===this) closeDM()">
@@ -395,6 +507,7 @@ function popupHtml(n, isSelf) {
     `<div class="row" style="margin-top:0.6rem;">
        <button class="mini" onclick="openDM('${esc(u.id)}','${esc(u.longName || u.id)}')">Message</button>
        <button class="mini" onclick="traceNode('${esc(u.id)}','${esc(u.longName || u.id)}')">Trace route</button>
+       <button class="mini danger" onclick="openRemoteAdmin('${esc(u.id)}','${esc(u.longName || u.id)}')">Admin</button>
      </div>`;
   return `<strong>${esc(u.longName || '(unknown)')}</strong> ${esc(u.shortName || '')}<br>` +
     `<span class="muted">${esc(u.id || '')} · ${src}</span><br>` +
@@ -430,6 +543,163 @@ function updateMap(nodes) {
     map.fitBounds(bounds, {maxZoom: 13, padding: [30, 30]});
     window.MAP_FIT_DONE = true;
   }
+}
+
+/* ---- Coverage trail -------------------------------------------------------
+   Every point is a position packet that actually reached this node, so the
+   layer reads as "here I was heard, this well, over this many hops" rather
+   than as a GPS breadcrumb track. The dashed segments are the honest part:
+   they mark stretches where nothing arrived, which is either out-of-range or
+   simply not-beaconing — the receiver can't tell those apart. */
+let TRAIL_LAYER = null;
+let TRAIL_HEAT = null;
+let TRAIL_NODES_LOADED = false;
+// A mobile node beacons every few minutes; a quarter-hour of silence is long
+// enough to be interesting and short enough not to dash the whole track.
+const TRAIL_GAP_SECS = 900;
+
+function snrColor(snr) {
+  if (snr === null || snr === undefined) return '#8899aa';
+  if (snr >= 5) return '#33ff99';
+  if (snr >= -5) return '#ffcc33';
+  return '#ff3366';
+}
+
+/* The packet header carries only the LAST BYTE of the relaying node's number,
+   so this can be ambiguous — with ~90 nodes in the DB a byte collision is
+   likely enough that we show every candidate rather than pick one and be
+   confidently wrong about which neighbour carried the packet home. */
+function relayName(relayByte) {
+  if (!relayByte) return '';
+  const hits = LAST_NODES.filter(n => (n.num & 0xff) === relayByte)
+    .map(n => (n.user || {}).shortName || (n.user || {}).longName || '?');
+  if (!hits.length) return `0x${relayByte.toString(16)}`;
+  if (hits.length === 1) return esc(hits[0]);
+  return `${esc(hits.join(' / '))} <span class="muted">(ambiguous)</span>`;
+}
+
+function trailPopup(p, name) {
+  const hops = p.hops_away === null || p.hops_away === undefined
+    ? 'unknown'
+    : (p.hops_away === 0 ? 'direct — no relay' : `${p.hops_away} hop${p.hops_away > 1 ? 's' : ''}`);
+  const home = window.ORIGIN
+    ? `${milesBetween([window.ORIGIN.lat, window.ORIGIN.lon], [p.lat, p.lon]).toFixed(1)} mi from home`
+    : '';
+  return `<div class="trail-popup"><b>${esc(name || p.node_id)}</b><br>` +
+    `<span class="muted">${new Date(p.ts * 1000).toLocaleString()} · ${fmtAgo(p.ts)}</span><br>` +
+    `SNR ${p.snr ?? '—'} dB${p.rssi ? ` · RSSI ${p.rssi}` : ''}<br>` +
+    `Path: ${hops}${p.relay_node ? ` · last relay ${relayName(p.relay_node)}` : ''}<br>` +
+    `Ch ${p.channel ?? '—'} · ${p.precision_bits ?? '?'}-bit fix${p.via_mqtt ? ' · via MQTT' : ''}` +
+    (home ? `<br><span class="muted">${home}</span>` : '') + `</div>`;
+}
+
+async function refreshTrail() {
+  if (!map) return;
+  const nodeId = document.getElementById('trail-node').value;
+  const summary = document.getElementById('trail-summary');
+  if (TRAIL_LAYER) { map.removeLayer(TRAIL_LAYER); TRAIL_LAYER = null; }
+  if (TRAIL_HEAT) { map.removeLayer(TRAIL_HEAT); TRAIL_HEAT = null; }
+
+  const hours = document.getElementById('trail-hours').value;
+  const prec = document.getElementById('trail-precision').value;
+  const rfOnly = document.getElementById('trail-rf-only').checked;
+  const qs = new URLSearchParams();
+  if (nodeId) qs.set('node', nodeId);
+  // No node picked yet means this is the discovery call that fills the picker —
+  // don't drag the whole point set over for a list of node ids.
+  else qs.set('limit', '1');
+  if (hours) qs.set('hours', hours);
+  if (prec) qs.set('min_precision', prec);
+  if (rfOnly) qs.set('rf_only', '1');
+
+  let data;
+  try {
+    const r = await fetch('/api/position-trail?' + qs.toString());
+    if (!r.ok) { summary.textContent = `trail failed (${r.status})`; return; }
+    data = await r.json();
+  } catch (e) {
+    summary.textContent = 'trail unreachable';
+    return;
+  }
+
+  // Populate the picker once, from whatever actually has logged positions —
+  // no point offering nodes with nothing to draw.
+  if (!TRAIL_NODES_LOADED && data.nodes) {
+    const sel = document.getElementById('trail-node');
+    const saved = localStorage.getItem('cybermesh-trail-node');
+    const byPoints = [...data.nodes].sort((a, b) => b.points - a.points);
+    byPoints.forEach(n => {
+      const o = document.createElement('option');
+      o.value = n.node_id;
+      o.textContent = `${n.name || n.node_id} (${n.points})`;
+      sel.appendChild(o);
+    });
+    TRAIL_NODES_LOADED = true;
+    const want = saved !== null ? saved : (byPoints[0] ? byPoints[0].node_id : '');
+    if (want && [...sel.options].some(o => o.value === want)) {
+      sel.value = want;
+      if (want !== nodeId) return refreshTrail();
+    }
+  }
+  if (!nodeId) { summary.textContent = data.nodes && data.nodes.length ? '' : 'no positions logged yet'; return; }
+
+  const pts = data.points || [];
+  if (!pts.length) {
+    summary.textContent = 'no positions in this window';
+    return;
+  }
+  const name = (data.nodes.find(n => n.node_id === nodeId) || {}).name;
+  const now = Date.now() / 1000;
+  const newest = pts[pts.length - 1].ts;
+  const oldest = pts[0].ts;
+  const span = Math.max(1, newest - oldest);
+  const layers = [];
+
+  // Track line first so the points sit on top of it.
+  for (let i = 1; i < pts.length; i++) {
+    const a = pts[i - 1], b = pts[i];
+    const gap = b.ts - a.ts > TRAIL_GAP_SECS;
+    layers.push(L.polyline([[a.lat, a.lon], [b.lat, b.lon]], {
+      color: gap ? '#66707c' : '#33e0ff',
+      weight: gap ? 1 : 2,
+      opacity: gap ? 0.5 : 0.45,
+      dashArray: gap ? '4,7' : null,
+    }));
+  }
+
+  let direct = 0;
+  pts.forEach(p => {
+    if (p.hops_away === 0) direct++;
+    const relayed = p.hops_away !== null && p.hops_away !== undefined && p.hops_away > 0;
+    // Older points fade so a long window still reads chronologically.
+    const age = 0.35 + 0.65 * ((p.ts - oldest) / span);
+    layers.push(L.circleMarker([p.lat, p.lon], {
+      radius: 5,
+      color: snrColor(p.snr),
+      weight: 2,
+      opacity: age,
+      fillColor: snrColor(p.snr),
+      fillOpacity: relayed ? 0.08 : age * 0.9,
+    }).bindPopup(trailPopup(p, name)));
+  });
+
+  const mode = document.getElementById('trail-mode').value;
+  if (mode !== 'heat') {
+    TRAIL_LAYER = L.layerGroup(layers).addTo(map);
+  }
+  if (mode !== 'points' && L.heatLayer) {
+    // Weight by link quality, not by visit count — a bright patch should mean
+    // "got out easily from here", not "stood here a long time".
+    TRAIL_HEAT = L.heatLayer(pts.map(p => {
+      const snr = p.snr === null || p.snr === undefined ? -5 : p.snr;
+      return [p.lat, p.lon, Math.min(1, Math.max(0.15, (snr + 20) / 32))];
+    }), {radius: 22, blur: 18, maxZoom: 15}).addTo(map);
+  }
+
+  const pct = Math.round(100 * direct / pts.length);
+  const coarse = pts.filter(p => (p.precision_bits ?? 0) < 32).length;
+  summary.innerHTML = `${pts.length} receptions · ${pct}% direct · last ${esc(fmtAgo(newest))}` +
+    (coarse ? ` · <span style="color:var(--warn)">${coarse} coarse-precision</span>` : '');
 }
 
 async function refreshNodes() {
@@ -491,7 +761,8 @@ function render() {
       const actions = isSelf ? '' : `
         <button class="mini" onclick="event.stopPropagation();openDM('${esc(u.id)}','${esc(u.longName || u.id)}')">DM</button>
         <button class="mini" onclick="event.stopPropagation();traceNode('${esc(u.id)}','${esc(u.longName || u.id)}')">Trace</button>
-        <button class="mini" onclick="event.stopPropagation();openNotes('${esc(u.id)}','${esc(u.longName || u.id)}')">Notes</button>`;
+        <button class="mini" onclick="event.stopPropagation();openNotes('${esc(u.id)}','${esc(u.longName || u.id)}')">Notes</button>
+        <button class="mini danger" onclick="event.stopPropagation();openRemoteAdmin('${esc(u.id)}','${esc(u.longName || u.id)}')">Admin</button>`;
       return `<tr onclick="focusNode(${n.num}, ${hasPos})" class="${fav ? 'fav-row' : ''}">
         <td>${favBtn}</td>
         <td class="sym">${esc(u.shortName || '')}</td>
@@ -684,6 +955,46 @@ async function traceNode(nodeId, name) {
   } catch (e) { toast('traceroute request failed', true); }
 }
 
+async function pingFleet() {
+  const btn = document.getElementById('ping-fleet-btn');
+  btn.disabled = true;
+  btn.textContent = '⏳ Pinging fleet…';
+  try {
+    const r = await fetch('/api/fleet-ping', { method: 'POST' });
+    const d = await r.json();
+    if (d.error) { toast('Ping failed: ' + d.error, true); return; }
+    let lines = [];
+    for (const [name, result] of Object.entries(d.results)) {
+      if (result.status === 'ok') {
+        const hops = (result.route || []).length;
+        const lastHop = result.route?.[result.route.length - 1];
+        const snr = lastHop?.snr != null ? `${lastHop.snr} dB` : '?';
+        lines.push(`${name}: ✅ ${hops} hop(s), SNR ${snr}`);
+      } else if (result.status === 'failed') {
+        lines.push(`${name}: ❌ ${result.error || 'route failed'}`);
+      } else {
+        lines.push(`${name}: ⏳ ${result.status}`);
+      }
+    }
+    if (d.pending?.length) {
+      for (const name of d.pending) {
+        lines.push(`${name}: ⏳ no response yet`);
+      }
+    }
+    if (lines.length) {
+      toast('⚡ Fleet ping:\\n' + lines.join('\\n'));
+    } else {
+      toast('⚡ Fleet ping: no results');
+    }
+    refreshTraceroutes();
+  } catch (e) {
+    toast('Ping request failed: ' + e, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '⚡ Ping fleet';
+  }
+}
+
 function hopChain(hops) {
   return hops.map(h =>
     `<span title="${esc(h.id)}">${esc(h.name)}</span>` +
@@ -818,6 +1129,144 @@ async function deleteSavedTraceroute(id) {
   } catch (e) { toast('delete failed', true); }
 }
 
+// Remote admin modal — generic enough for any trusted node, sharp enough to
+// need guardrails. Reads are open; writes/actions require typing the target ID.
+let REMOTE_ADMIN_TARGET = null;
+let REMOTE_ADMIN_SCHEMA = null;
+async function ensureRemoteSchema() {
+  if (REMOTE_ADMIN_SCHEMA) return REMOTE_ADMIN_SCHEMA;
+  const r = await fetch('/api/remote-admin/schema');
+  REMOTE_ADMIN_SCHEMA = await r.json();
+  return REMOTE_ADMIN_SCHEMA;
+}
+async function openRemoteAdmin(nodeId, name) {
+  if (!nodeId) { toast('That node has no ID yet', true); return; }
+  REMOTE_ADMIN_TARGET = nodeId;
+  document.getElementById('remote-admin-title').textContent = 'Remote Admin';
+  document.getElementById('remote-admin-sub').textContent = name + '  ·  ' + nodeId;
+  document.getElementById('remote-admin-confirm').value = '';
+  document.getElementById('remote-admin-confirm').placeholder = nodeId;
+  document.getElementById('remote-admin-output').textContent = 'Ready. Start with Read section; writes need exact node-id confirmation.';
+  await ensureRemoteSchema();
+  populateRemoteSections();
+  document.getElementById('remote-admin-backdrop').style.display = 'flex';
+  refreshRemoteLog();
+}
+function closeRemoteAdmin() {
+  document.getElementById('remote-admin-backdrop').style.display = 'none';
+  REMOTE_ADMIN_TARGET = null;
+}
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeRemoteAdmin(); });
+function populateRemoteSections() {
+  if (!REMOTE_ADMIN_SCHEMA) return;
+  const kind = document.getElementById('remote-admin-kind').value;
+  const sections = kind === 'module_config' ? REMOTE_ADMIN_SCHEMA.module_sections : REMOTE_ADMIN_SCHEMA.config_sections;
+  const select = document.getElementById('remote-admin-section');
+  const old = select.value;
+  select.textContent = '';
+  sections.forEach(s => {
+    const opt = document.createElement('option');
+    opt.value = s;
+    opt.textContent = s;
+    select.appendChild(opt);
+  });
+  if (sections.includes(old)) select.value = old;
+}
+function remoteSetKindSection(kind, section) {
+  document.getElementById('remote-admin-kind').value = kind;
+  populateRemoteSections();
+  document.getElementById('remote-admin-section').value = section;
+}
+function remotePreset(values, kind, section) {
+  remoteSetKindSection(kind, section);
+  document.getElementById('remote-admin-json').value = JSON.stringify(values, null, 2);
+}
+function remotePayloadBase() {
+  return {
+    node_id: REMOTE_ADMIN_TARGET,
+    kind: document.getElementById('remote-admin-kind').value,
+    section: document.getElementById('remote-admin-section').value,
+  };
+}
+function remoteShow(obj, isError=false) {
+  const out = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2);
+  const el = document.getElementById('remote-admin-output');
+  el.textContent = out;
+  el.style.color = isError ? 'var(--accent2)' : 'var(--muted)';
+}
+async function remoteGetSection() {
+  if (!REMOTE_ADMIN_TARGET) return;
+  remoteShow('Reading over LoRa… this can take a bit. Tiny packets, big feelings.');
+  try {
+    const r = await fetch('/api/remote-admin/get', {
+      method: 'POST', headers: {'Content-Type': 'application/json', 'X-CyberMesh-Remote-Admin': REMOTE_ADMIN_TARGET},
+      body: JSON.stringify(remotePayloadBase()),
+    });
+    const d = await r.json();
+    if (d.error) { remoteShow(d.error, true); toast(d.error, true); return; }
+    document.getElementById('remote-admin-json').value = JSON.stringify({[d.section]: d.values}, null, 2);
+    remoteShow(d);
+    refreshRemoteLog();
+  } catch (e) { remoteShow('request failed: ' + e.message, true); toast('remote read failed', true); }
+}
+async function remoteSetSection() {
+  if (!REMOTE_ADMIN_TARGET) return;
+  let values;
+  try { values = JSON.parse(document.getElementById('remote-admin-json').value || '{}'); }
+  catch (e) { remoteShow('JSON parse failed: ' + e.message, true); return; }
+  const base = remotePayloadBase();
+  // Allow either {"device": {...}} from a read/preset or raw section payload {...}.
+  if (values && values[base.section] && typeof values[base.section] === 'object') values = values[base.section];
+  const confirmText = document.getElementById('remote-admin-confirm').value.trim();
+  if (confirmText !== REMOTE_ADMIN_TARGET) {
+    remoteShow('Type the exact node ID (' + REMOTE_ADMIN_TARGET + ') before writing.', true);
+    return;
+  }
+  if (!confirm('Write ' + base.kind + '.' + base.section + ' to ' + REMOTE_ADMIN_TARGET + '? This can absolutely break the remote node.')) return;
+  remoteShow('Writing over LoRa…');
+  try {
+    const r = await fetch('/api/remote-admin/set', {
+      method: 'POST', headers: {'Content-Type': 'application/json', 'X-CyberMesh-Remote-Admin': REMOTE_ADMIN_TARGET},
+      body: JSON.stringify({...base, values: values, confirm: confirmText}),
+    });
+    const d = await r.json();
+    if (d.error) { remoteShow(d.error, true); toast(d.error, true); return; }
+    remoteShow(d); toast('remote write sent'); refreshRemoteLog();
+  } catch (e) { remoteShow('request failed: ' + e.message, true); toast('remote write failed', true); }
+}
+async function remoteAction(action) {
+  if (!REMOTE_ADMIN_TARGET) return;
+  const confirmText = document.getElementById('remote-admin-confirm').value.trim();
+  if (action !== 'metadata' && confirmText !== REMOTE_ADMIN_TARGET) {
+    remoteShow('Type the exact node ID (' + REMOTE_ADMIN_TARGET + ') before ' + action + '.', true);
+    return;
+  }
+  if (action !== 'metadata' && !confirm('Send ' + action + ' to ' + REMOTE_ADMIN_TARGET + '? Last chance before the tiny radio learns consequences.')) return;
+  remoteShow('Sending ' + action + '…');
+  try {
+    const r = await fetch('/api/remote-admin/action', {
+      method: 'POST', headers: {'Content-Type': 'application/json', 'X-CyberMesh-Remote-Admin': REMOTE_ADMIN_TARGET},
+      body: JSON.stringify({node_id: REMOTE_ADMIN_TARGET, action: action, confirm: confirmText, secs: parseInt(document.getElementById('remote-admin-secs').value || '10', 10)}),
+    });
+    const d = await r.json();
+    if (d.error) { remoteShow(d.error, true); toast(d.error, true); return; }
+    remoteShow(d); toast(action + ' sent'); refreshRemoteLog();
+  } catch (e) { remoteShow('request failed: ' + e.message, true); toast('remote action failed', true); }
+}
+async function refreshRemoteLog() {
+  try {
+    const r = await fetch('/api/remote-admin/log');
+    const list = await r.json();
+    if (!list.length) return;
+    // Don't stomp a detailed result unless the output is still the initial/reading text.
+    const el = document.getElementById('remote-admin-output');
+    if (!/Ready|Reading|Writing|Sending/.test(el.textContent)) return;
+    el.textContent = list.slice(0, 8).map(e =>
+      `${fmtAgo(Math.floor(e.ts))} ${e.status.toUpperCase()} ${e.node_id} ${e.action}` + (e.detail ? ` ${JSON.stringify(e.detail)}` : '')
+    ).join('\n');
+  } catch (e) {}
+}
+
 async function adminAction(action) {
   if (!confirm('Send "' + action + '" to the node?')) return;
   try {
@@ -857,7 +1306,7 @@ async function loadHealthData() {
       fetch('/api/messages'),
     ]);
     HEALTH_TELEMETRY = tRes.ok ? await tRes.json() : [];
-    HEALTH_MESSAGES = mRes.ok ? await mRes.json() : [];
+    HEALTH_MESSAGES = mRes.ok ? (await mRes.json()).messages || [] : [];
   } catch (e) { HEALTH_TELEMETRY = []; HEALTH_MESSAGES = []; }
   renderHealthChart();
   updateCuHero();
@@ -1045,11 +1494,22 @@ document.querySelectorAll('.range-btn').forEach(btn => {
   });
 });
 
+['trail-node', 'trail-hours', 'trail-mode', 'trail-precision', 'trail-rf-only'].forEach(id => {
+  document.getElementById(id).addEventListener('change', () => {
+    if (id === 'trail-node') localStorage.setItem('cybermesh-trail-node', document.getElementById(id).value);
+    refreshTrail();
+  });
+});
+
 initMap();
 applySortHeaders();
 refreshNodes();
 refreshTraceroutes();
+refreshTrail();
 loadHealthData();
+// Positions arrive on the order of minutes, so this is deliberately slower
+// than the node poll — redrawing the trail moves layers under the cursor.
+setInterval(refreshTrail, 60000);
 setInterval(refreshNodes, 10000);
 setInterval(refreshTraceroutes, 5000);
 setInterval(loadHealthData, 30000);

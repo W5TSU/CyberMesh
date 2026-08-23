@@ -1,0 +1,401 @@
+{% extends "base.html" %}
+{% block title %} — BBS{% endblock %}
+{% block head %}
+<style>
+  .bbs-tabs { display: flex; gap: 0.4rem; flex-wrap: wrap; margin-bottom: 1rem; }
+  .bbs-tabs button {
+    color: var(--muted);
+    border-color: var(--border);
+  }
+  .bbs-tabs button.on {
+    color: var(--accent);
+    border-color: var(--accent);
+    background: rgba(51,224,255,0.1);
+  }
+  .post-body {
+    white-space: pre-wrap;
+    font-size: 0.85rem;
+    color: var(--text);
+    margin: 0.4rem 0 0.6rem;
+    max-height: 12rem;
+    overflow: auto;
+  }
+  .post-card {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.7rem 0.9rem;
+    margin-bottom: 0.6rem;
+    background: #0e151c;
+  }
+  .post-card.pending { border-color: var(--warn); }
+  .bbs-meta { font-size: 0.78rem; color: var(--muted); }
+  .board-chip {
+    display: inline-block;
+    padding: 0.2rem 0.55rem;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    margin: 0 0.3rem 0.3rem 0;
+    cursor: pointer;
+    font-size: 0.85rem;
+    color: var(--muted);
+  }
+  .board-chip.on {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: rgba(51,224,255,0.08);
+  }
+  #bbs-disabled {
+    display: none;
+  }
+  #bbs-disabled.show { display: block; }
+  #bbs-main.hidden { display: none; }
+</style>
+{% endblock %}
+{% block content %}
+<div id="bbs-disabled" class="panel">
+  <h2>BBS offline</h2>
+  <p class="muted" style="margin:0;">
+    Set <code>BBS_ENABLED=1</code> in <code>~/cybermesh/.env</code> and restart
+    <code>cybermesh.service</code>. RF path: DM this node the keyword <strong>BBS</strong>.
+  </p>
+</div>
+
+<div id="bbs-main" class="hidden">
+  <div class="panel">
+    <div class="row" style="justify-content:space-between;">
+      <h2 style="margin:0;">CyberMesh BBS</h2>
+      <span class="muted" id="bbs-status-line">…</span>
+    </div>
+    <p class="muted" style="margin:0.5rem 0 0;">
+      Single-node v0 — mesh users DM <strong>BBS</strong> to open the menu.
+      This page is sysop-only (same Tailscale perimeter as Config).
+    </p>
+  </div>
+
+  <div class="bbs-tabs">
+    <button type="button" class="on" data-tab="boards" onclick="switchTab('boards')">Boards</button>
+    <button type="button" data-tab="pending" onclick="switchTab('pending')">Pending <span id="pending-badge"></span></button>
+    <button type="button" data-tab="mail" onclick="switchTab('mail')">Mail</button>
+    <button type="button" data-tab="sessions" onclick="switchTab('sessions')">Sessions</button>
+  </div>
+
+  <div id="tab-boards">
+    <div class="panel">
+      <h2>Boards</h2>
+      <div id="board-chips" class="row" style="margin-bottom:0.8rem;"></div>
+      <div class="row" style="margin-bottom:0.8rem;">
+        <input type="text" id="new-board-name" placeholder="New board name" maxlength="40" style="flex:1;">
+        <label class="muted" style="display:flex;align-items:center;gap:0.35rem;">
+          <input type="checkbox" id="new-board-mod"> moderated
+        </label>
+        <button type="button" onclick="createBoard()">Add board</button>
+      </div>
+      <div id="posts-list" class="muted">Select a board…</div>
+    </div>
+    <div class="panel">
+      <h2>New post <span class="muted" id="compose-board-label"></span></h2>
+      <div class="row" style="margin-bottom:0.5rem;">
+        <input type="text" id="post-subject" placeholder="Subject" maxlength="100" style="flex:1;">
+      </div>
+      <textarea id="post-body" placeholder="Body" style="min-height:100px;"></textarea>
+      <div class="row" style="margin-top:0.5rem;">
+        <button type="button" onclick="createPost()">Post as sysop</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="tab-pending" style="display:none;">
+    <div class="panel">
+      <h2>Pending approval</h2>
+      <div id="pending-list" class="muted">Loading…</div>
+    </div>
+  </div>
+
+  <div id="tab-mail" style="display:none;">
+    <div class="panel">
+      <h2>All mail</h2>
+      <div id="mail-list" class="muted">Loading…</div>
+    </div>
+  </div>
+
+  <div id="tab-sessions" style="display:none;">
+    <div class="panel">
+      <h2>Active DM sessions</h2>
+      <p class="muted">Idle timeout 15 min. Empty is normal when nobody is in the menu.</p>
+      <div id="sessions-list" class="muted">Loading…</div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+{% block script %}
+function esc(s) {
+  return (s ?? '').toString().replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function fmtTs(ts) {
+  if (!ts) return '—';
+  try {
+    return new Date(ts * 1000).toLocaleString();
+  } catch (e) { return String(ts); }
+}
+
+let BOARDS = [];
+let selectedBoardId = null;
+let currentTab = 'boards';
+
+function switchTab(name) {
+  currentTab = name;
+  document.querySelectorAll('.bbs-tabs button').forEach(b => {
+    b.classList.toggle('on', b.dataset.tab === name);
+  });
+  ['boards', 'pending', 'mail', 'sessions'].forEach(t => {
+    const el = document.getElementById('tab-' + t);
+    if (el) el.style.display = t === name ? '' : 'none';
+  });
+  if (name === 'pending') loadPending();
+  if (name === 'mail') loadMail();
+  if (name === 'sessions') loadSessions();
+}
+
+async function refreshBbsStatus() {
+  try {
+    const r = await fetch('/api/bbs/status');
+    const d = await r.json();
+    const dis = document.getElementById('bbs-disabled');
+    const main = document.getElementById('bbs-main');
+    if (!d.enabled) {
+      dis.classList.add('show');
+      main.classList.add('hidden');
+      return false;
+    }
+    dis.classList.remove('show');
+    main.classList.remove('hidden');
+    const pend = d.pending || 0;
+    document.getElementById('bbs-status-line').textContent =
+      `${d.boards} board(s) · ${d.sessions} session(s)` + (pend ? ` · ${pend} pending` : '');
+    const badge = document.getElementById('pending-badge');
+    badge.textContent = pend ? `(${pend})` : '';
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function loadBoards() {
+  const r = await fetch('/api/bbs/boards');
+  if (!r.ok) return;
+  BOARDS = await r.json();
+  const chips = document.getElementById('board-chips');
+  if (!BOARDS.length) {
+    chips.innerHTML = '<span class="muted">No boards</span>';
+    return;
+  }
+  if (selectedBoardId == null) selectedBoardId = BOARDS[0].id;
+  chips.innerHTML = BOARDS.map(b => {
+    const on = b.id === selectedBoardId ? 'on' : '';
+    const mod = b.moderated ? ' · mod' : '';
+    return `<span class="board-chip ${on}" onclick="selectBoard(${b.id})">${esc(b.name)} (${b.post_count}${mod})</span>`;
+  }).join('');
+  const b = BOARDS.find(x => x.id === selectedBoardId);
+  document.getElementById('compose-board-label').textContent = b ? 'on ' + b.name : '';
+  await loadPosts();
+}
+
+function selectBoard(id) {
+  selectedBoardId = id;
+  loadBoards();
+}
+
+async function loadPosts() {
+  const box = document.getElementById('posts-list');
+  if (selectedBoardId == null) {
+    box.textContent = 'Select a board…';
+    return;
+  }
+  const r = await fetch(`/api/bbs/boards/${selectedBoardId}/posts?status=visible`);
+  if (!r.ok) {
+    box.textContent = 'Failed to load posts';
+    return;
+  }
+  const posts = await r.json();
+  if (!posts.length) {
+    box.innerHTML = '<span class="muted">No posts yet. Mesh users: B → board → N &lt;subj&gt;</span>';
+    return;
+  }
+  box.innerHTML = posts.map(p => postCard(p, false)).join('');
+}
+
+function postCard(p, showApprove) {
+  const actions = showApprove
+    ? `<button type="button" onclick="approvePost(${p.id})">Approve</button>
+       <button type="button" class="danger" onclick="rejectPost(${p.id})">Reject</button>`
+    : `<button type="button" class="danger" onclick="deletePost(${p.id})">Delete</button>`;
+  const boardLine = p.board_name
+    ? `<div class="bbs-meta">board: ${esc(p.board_name)}</div>`
+    : '';
+  return `<div class="post-card ${p.status === 'pending_approval' ? 'pending' : ''}">
+    <div class="row" style="justify-content:space-between;">
+      <strong>${esc(p.subject)}</strong>
+      <span class="bbs-meta">${esc(fmtTs(p.timestamp))}</span>
+    </div>
+    <div class="bbs-meta">from ${esc(p.author_node)} · #${p.id} · ${esc(p.status)}</div>
+    ${boardLine}
+    <div class="post-body">${esc(p.body)}</div>
+    <div class="row">${actions}</div>
+  </div>`;
+}
+
+async function createBoard() {
+  const name = document.getElementById('new-board-name').value.trim();
+  if (!name) return;
+  const moderated = document.getElementById('new-board-mod').checked;
+  const r = await fetch('/api/bbs/boards', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name, moderated})
+  });
+  const d = await r.json();
+  if (d.error) { toast(d.error, true); return; }
+  document.getElementById('new-board-name').value = '';
+  document.getElementById('new-board-mod').checked = false;
+  toast('Board created');
+  selectedBoardId = d.id;
+  await refreshBbsStatus();
+  await loadBoards();
+}
+
+async function createPost() {
+  if (selectedBoardId == null) { toast('Select a board', true); return; }
+  const subject = document.getElementById('post-subject').value.trim();
+  const body = document.getElementById('post-body').value.trim();
+  if (!subject || !body) { toast('Subject and body required', true); return; }
+  const r = await fetch(`/api/bbs/boards/${selectedBoardId}/posts`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({subject, body, force_visible: true})
+  });
+  const d = await r.json();
+  if (d.error) { toast(d.error, true); return; }
+  document.getElementById('post-subject').value = '';
+  document.getElementById('post-body').value = '';
+  toast('Posted');
+  await loadBoards();
+}
+
+async function deletePost(id) {
+  if (!confirm('Delete this post?')) return;
+  const r = await fetch(`/api/bbs/posts/${id}`, {method: 'DELETE'});
+  const d = await r.json();
+  if (d.error) { toast(d.error, true); return; }
+  toast('Deleted');
+  await loadBoards();
+  if (currentTab === 'pending') loadPending();
+}
+
+async function approvePost(id) {
+  const r = await fetch(`/api/bbs/posts/${id}/approve`, {method: 'POST'});
+  const d = await r.json();
+  if (d.error) { toast(d.error, true); return; }
+  toast('Approved');
+  await refreshBbsStatus();
+  loadPending();
+  loadBoards();
+}
+
+async function rejectPost(id) {
+  if (!confirm('Reject (delete) this pending post?')) return;
+  const r = await fetch(`/api/bbs/posts/${id}/reject`, {method: 'POST'});
+  const d = await r.json();
+  if (d.error) { toast(d.error, true); return; }
+  toast('Rejected');
+  await refreshBbsStatus();
+  loadPending();
+}
+
+async function loadPending() {
+  const box = document.getElementById('pending-list');
+  const r = await fetch('/api/bbs/boards');
+  if (!r.ok) { box.textContent = 'Failed'; return; }
+  const boards = await r.json();
+  const all = [];
+  for (const b of boards) {
+    const pr = await fetch(`/api/bbs/boards/${b.id}/posts?status=pending_approval`);
+    if (!pr.ok) continue;
+    const posts = await pr.json();
+    posts.forEach(p => all.push({...p, board_name: b.name}));
+  }
+  if (!all.length) {
+    box.innerHTML = '<span class="muted">Nothing pending.</span>';
+    return;
+  }
+  all.sort((a, b) => b.timestamp - a.timestamp);
+  box.innerHTML = all.map(p => postCard(p, true)).join('');
+}
+
+async function loadMail() {
+  const box = document.getElementById('mail-list');
+  const r = await fetch('/api/bbs/mail');
+  if (!r.ok) { box.textContent = 'Failed'; return; }
+  const mail = await r.json();
+  if (!mail.length) {
+    box.innerHTML = '<span class="muted">No mail yet.</span>';
+    return;
+  }
+  box.innerHTML = mail.map(m => `
+    <div class="post-card">
+      <div class="row" style="justify-content:space-between;">
+        <strong>${esc(m.subject)}</strong>
+        <span class="bbs-meta">${esc(fmtTs(m.timestamp))}${m.read ? '' : ' · <span style="color:var(--warn)">unread</span>'}</span>
+      </div>
+      <div class="bbs-meta">${esc(m.from_node)} → ${esc(m.to_node)} · #${m.id}</div>
+      <div class="post-body">${esc(m.body)}</div>
+      <div class="row">
+        <button type="button" class="danger" onclick="deleteMail(${m.id})">Delete</button>
+      </div>
+    </div>
+  `).join('');
+}
+
+async function deleteMail(id) {
+  if (!confirm('Delete this mail?')) return;
+  const r = await fetch(`/api/bbs/mail/${id}`, {method: 'DELETE'});
+  const d = await r.json();
+  if (d.error) { toast(d.error, true); return; }
+  toast('Deleted');
+  loadMail();
+}
+
+async function loadSessions() {
+  const box = document.getElementById('sessions-list');
+  const r = await fetch('/api/bbs/sessions');
+  if (!r.ok) { box.textContent = 'Failed'; return; }
+  const sessions = await r.json();
+  if (!sessions.length) {
+    box.innerHTML = '<span class="muted">No active sessions.</span>';
+    return;
+  }
+  box.innerHTML = `<table>
+    <thead><tr><th>Node</th><th>State</th><th>Last activity</th></tr></thead>
+    <tbody>
+      ${sessions.map(s => `<tr>
+        <td><code>${esc(s.node_id)}</code></td>
+        <td>${esc(s.state)}</td>
+        <td class="bbs-meta">${esc(fmtTs(s.updated_at))}</td>
+      </tr>`).join('')}
+    </tbody>
+  </table>`;
+}
+
+(async function initBbs() {
+  const ok = await refreshBbsStatus();
+  if (!ok) return;
+  await loadBoards();
+  setInterval(async () => {
+    await refreshBbsStatus();
+    if (currentTab === 'boards') loadBoards();
+    else if (currentTab === 'pending') loadPending();
+    else if (currentTab === 'mail') loadMail();
+    else if (currentTab === 'sessions') loadSessions();
+  }, 15000);
+})();
+{% endblock %}

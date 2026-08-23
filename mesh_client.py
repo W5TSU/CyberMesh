@@ -1,5 +1,6 @@
 import base64
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -51,6 +52,18 @@ WATCHDOG_MAX_PER_HOUR = 6
 REDACTED = "••••••••"
 SECRET_CONFIG_FIELDS = {"network": {"wifi_psk"}, "security": {"private_key"}}
 SECRET_MODULE_FIELDS = {"mqtt": {"password"}}
+# Remote-admin responses go to the browser too. Public keys are not secret, but
+# admin_key is still credential-ish clutter; show that it exists without
+# dumping raw key material into every phone screenshot. The user's actual
+# private key and WiFi/MQTT passwords stay masked, obviously.
+REMOTE_SECRET_CONFIG_FIELDS = {
+    "network": {"wifi_psk"},
+    "security": {"private_key", "admin_key"},
+}
+REMOTE_SECRET_MODULE_FIELDS = SECRET_MODULE_FIELDS
+
+REMOTE_ADMIN_LOG_LIMIT = 80
+REMOTE_ADMIN_TIMEOUT_SECS = 75
 
 CONFIG_SECTIONS = ["device", "position", "power", "network", "display", "lora", "bluetooth", "security"]
 MODULE_SECTIONS = [
@@ -117,6 +130,18 @@ def _strip_redacted(section, values, secret_map):
     return {k: v for k, v in values.items() if not (k in secrets and v == REDACTED)}
 
 
+def _redact_section(section, values, secret_map):
+    """Redact a single section dict (remote-admin returns one section at a time)."""
+    secrets = secret_map.get(section)
+    if not secrets:
+        return values
+    redacted = dict(values)
+    for name in secrets:
+        if redacted.get(name):
+            redacted[name] = REDACTED
+    return redacted
+
+
 def _field_entry(f):
     """Classify a protobuf field for form rendering. Returns None for field
     kinds the form can't safely render (nested messages, repeated bytes) —
@@ -170,7 +195,8 @@ def build_schema():
 
 class MeshClient:
     def __init__(self, host, serial_port=None, transport="auto",
-                 home_lat=None, home_lon=None, store=None, node_store=None):
+                 home_lat=None, home_lon=None, store=None, node_store=None,
+                 bbs_engine=None):
         self.host = host
         self.serial_port = serial_port
         self.home_lat = home_lat
@@ -189,7 +215,12 @@ class MeshClient:
             # Rehydrate so a restart doesn't look like the mesh went silent.
             self.messages.extend(store.recent(MESSAGE_HISTORY_LIMIT))
         self.node_store = node_store
+        # Single-node BBS (v0). None when BBS_ENABLED is off. See bbs/ and
+        # ~/cybermesh-bbs/DESIGN.md. Wired after construct from app.py is fine
+        # too — attribute is always present so the receive path can check it.
+        self.bbs_engine = bbs_engine
         self.traceroutes = {}  # node id -> latest result
+        self.remote_admin_log = deque(maxlen=REMOTE_ADMIN_LOG_LIMIT)
         if node_store is not None:
             # Same rehydration idea as messages above: without this, every
             # restart (routine after a template edit — see Known Incidents)
@@ -201,9 +232,20 @@ class MeshClient:
         self.last_auto_reboot = None
         self.auto_reboot_history = deque(maxlen=WATCHDOG_MAX_PER_HOUR)
         self.last_seen = {}  # node id -> our own wall-clock time of last packet
+        # node id -> when it last sent a position packet carrying no usable fix.
+        # Lets a range probe tell "answered, but GPS cold" apart from "silent".
+        self.last_fixless_position = {}
         pub.subscribe(self._on_receive_text, "meshtastic.receive.text")
+        pub.subscribe(self._on_receive_reply, "meshtastic.receive.data.REPLY_APP")
         pub.subscribe(self._on_any_receive, "meshtastic.receive")
         pub.subscribe(self._on_telemetry, "meshtastic.receive.telemetry")
+        pub.subscribe(self._on_position, "meshtastic.receive.position")
+        # Routing ACK/NAK for our outbound wantAck traffic. We deliberately do
+        # NOT use MeshInterface's onResponse callback for multi-ack tracking —
+        # the library pops the handler on the *first* response, so a local
+        # MAX_RETRANSMIT would permanently drop every later relay ack. Pubsub
+        # publishes every ROUTING_APP packet, so we can accumulate hearers.
+        pub.subscribe(self._on_routing, "meshtastic.receive.routing")
         pub.subscribe(self._on_connection_lost, "meshtastic.connection.lost")
         self._stop = False
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -225,20 +267,104 @@ class MeshClient:
         except (KeyError, TypeError):
             return
         toId = packet.get("toId")
-        self._record({
+        is_direct = bool(toId) and toId != BROADCAST_ADDR
+
+        # Resolve sender long name before _record buries it
+        from_name = None
+        from_short = None
+        try:
+            if self.iface and fromId:
+                node = (self.iface.nodes or {}).get(fromId)
+                from_name = (node or {}).get("user", {}).get("longName")
+                from_short = (node or {}).get("user", {}).get("shortName")
+        except Exception:
+            pass
+        # Persist the name we just saw — this is what lets the UI keep showing
+        # a friendly name long after the node leaves the mesh's live DB.
+        if self.store is not None and fromId and from_name:
+            try:
+                self.store.record_node_name(fromId, from_name, from_short)
+            except Exception:
+                pass
+
+        msg = {
             "id": packet.get("id"),
             "ts": time.time(),
             "from": fromId,
+            "from_name": from_name,
             "to": toId,
             # A packet addressed to us specifically rather than to ^all is a
             # direct message — the UI threads those separately.
-            "direct": bool(toId) and toId != BROADCAST_ADDR,
+            "direct": is_direct,
             "channel": channel,
             "via_mqtt": bool(packet.get("viaMqtt")),
             "text": text,
             "status": "received",
             "status_reason": None,
-        })
+            # Last-hop RF meta (not a full multi-hop route — use traceroute for that)
+            **self._rf_meta_from_packet(packet),
+        }
+        self._record(msg)
+
+        # BBS v0 — DM keyword "BBS" or an active session. Must not block the
+        # meshtastic receive thread (same lesson as traceroute/async connect).
+        if is_direct and self.bbs_engine and fromId:
+            try:
+                if self.bbs_engine.should_handle(fromId, text):
+                    threading.Thread(
+                        target=self._bbs_handle_dm,
+                        args=(fromId, text),
+                        daemon=True,
+                        name=f"bbs-{fromId}",
+                    ).start()
+            except Exception:
+                logger.exception("BBS should_handle failed for %s — fail open", fromId)
+
+    def _bbs_handle_dm(self, from_id, text):
+        """Worker: run BBS engine and send reply. Never called on the RX thread."""
+        try:
+            result = self.bbs_engine.handle(from_id, text)
+        except Exception:
+            logger.exception("BBS handle failed for %s", from_id)
+            return
+        if not result.get("handled"):
+            return
+        reply = result.get("reply")
+        if not reply:
+            return
+        try:
+            self.send_text(reply, destination=from_id)
+            logger.info(
+                "BBS reply → %s (session_active=%s): %s",
+                from_id,
+                result.get("session_active"),
+                (reply[:80] + "…") if len(reply) > 80 else reply,
+            )
+        except Exception as e:
+            logger.warning("BBS reply send to %s failed: %s", from_id, e)
+
+    def _on_receive_reply(self, packet, interface=None):
+        """Handle Meshtastic tapbacks/reactions (REPLY_APP).
+
+        Firmware carries the target message id in decoded.replyId and the emoji
+        as a Unicode code point in decoded.emoji. The Python library does not
+        currently decode REPLY_APP specially, so we subscribe to the raw data
+        topic and do the tiny bit of translation here.
+        """
+        try:
+            decoded = packet.get("decoded", {})
+            target_id = decoded.get("replyId") or decoded.get("reply_id")
+            emoji_code = decoded.get("emoji")
+            if not target_id or not emoji_code:
+                return
+            emoji = chr(int(emoji_code))
+            from_id = packet.get("fromId") or None
+            if not from_id:
+                num = packet.get("from")
+                from_id = f"!{num:08x}" if num else None
+        except Exception:
+            return
+        self._record_reaction(target_id, from_id, emoji)
 
     def _on_any_receive(self, packet, interface=None):
         """Track our own last-seen time for every packet type, not just text.
@@ -286,6 +412,85 @@ class MeshClient:
             )
         except Exception:
             pass
+
+    def _on_position(self, packet, interface=None):
+        """Log every position packet that reaches us, with the link quality it
+        arrived on — this is the coverage map's raw material.
+
+        Deliberately NOT the same thing as the node DB's current position: the
+        library overwrites that in place, so a node that beacons a precise fix
+        on our private channel and a deliberately-fuzzed one on the public
+        channel ends up showing whichever landed last. Keeping the packets
+        themselves, tagged with `channel` and `precision_bits`, is what lets
+        the UI ask for only the full-resolution fleet positions later.
+        """
+        if self.node_store is None:
+            return
+        try:
+            from_id = packet.get("fromId") or None
+            if not from_id:
+                num = packet.get("from")
+                if num is None:
+                    return
+                from_id = f"!{num:08x}"
+
+            pos = (packet.get("decoded") or {}).get("position") or {}
+            lat = pos.get("latitude")
+            lon = pos.get("longitude")
+            # A GPS with no fix reports a literal 0,0 rather than omitting the
+            # field — plotting those puts a node in the Gulf of Guinea.
+            if lat in (None, 0) or lon in (None, 0):
+                # Not plottable, but far from meaningless: the node HEARD us and
+                # answered, it just has nothing to say about where it is. Range
+                # probing needs that distinction — otherwise a node sitting in
+                # perfect RF range with a cold-starting GPS records as a string
+                # of coverage holes, which is exactly backwards.
+                self.last_fixless_position[from_id] = time.time()
+                return
+
+            # hopsAway isn't in the packet — it's the difference between the hop
+            # budget the sender set and what's left. 0 means it reached us
+            # directly, which for a mobile node is the real headline: no relay
+            # was needed from wherever this was transmitted.
+            hop_start = packet.get("hopStart")
+            hop_limit = packet.get("hopLimit")
+            hops = None
+            if hop_start is not None and hop_limit is not None:
+                hops = max(0, hop_start - hop_limit)
+
+            self.node_store.record_position({
+                "ts": time.time(),
+                "node_id": from_id,
+                "lat": lat,
+                "lon": lon,
+                "alt": pos.get("altitude"),
+                "precision_bits": pos.get("precisionBits"),
+                "channel": packet.get("channel", 0),
+                "snr": packet.get("rxSnr"),
+                "rssi": packet.get("rxRssi"),
+                "hops_away": hops,
+                "relay_node": packet.get("relayNode"),
+                "via_mqtt": bool(packet.get("viaMqtt")),
+                "pkt_id": packet.get("id"),
+                # The fix's OWN timestamp, not ours. A duty-cycled GPS
+                # (gps_update_interval > 10s puts it in hardsleep between
+                # searches) replies with the LAST fix it managed, which can be
+                # many minutes stale — at driving speed that's miles from where
+                # the packet was actually sent. Without this the map plots a
+                # stale fix as confidently as a fresh one.
+                "pos_time": pos.get("time"),
+            })
+
+            # Position is by far the most common beacon, so it's also the best
+            # opportunity to keep the persisted name map current — without this
+            # a node that only ever beacons shows up as a bare hex id forever.
+            if self.store is not None:
+                node = (self.iface.nodes or {}).get(from_id) if self.iface else None
+                user = (node or {}).get("user") or {}
+                if user.get("longName"):
+                    self.store.record_node_name(from_id, user["longName"], user.get("shortName"))
+        except Exception:
+            logger.debug("position log failed", exc_info=True)
 
     def _on_connection_lost(self, interface):
         logger.warning("Lost connection to %s", self.host)
@@ -350,6 +555,14 @@ class MeshClient:
                 self.last_error = None
                 self.disconnected_since = None
             logger.info("Connected via %s (%s)", kind, self.serial_port if kind == "serial" else self.host)
+            # Seed the durable node_names cache from the live node DB on every
+            # (re)connect — nodes we've heard from once keep their names in the
+            # UI even after they drop out of the mesh's in-memory node list.
+            if self.store is not None:
+                try:
+                    self.store.backfill_names(getattr(new_iface, "nodes", None) or {})
+                except Exception as e:
+                    logger.warning("Could not backfill node names: %s", e)
             return
 
         with self.lock:
@@ -491,6 +704,124 @@ class MeshClient:
 
     def get_schema(self):
         return build_schema()
+
+    # ---- remote admin -----------------------------------------------------
+    # These use the already-open gateway radio connection, so the web UI can
+    # admin many trusted remote nodes without stopping cybermesh.service and
+    # fighting over the serial port. Remote-admin is intentionally generic: it
+    # reads/writes protobuf sections by name, while the browser handles the
+    # "are you sure you want to brick that little goblin?" ceremony.
+
+    def _log_remote_admin(self, node_id, action, status, detail=None):
+        entry = {
+            "ts": time.time(),
+            "node_id": node_id,
+            "action": action,
+            "status": status,
+            "detail": detail,
+        }
+        self.remote_admin_log.append(entry)
+        return entry
+
+    def get_remote_admin_log(self):
+        return sorted(list(self.remote_admin_log), key=lambda e: -e["ts"])
+
+    def _remote_node(self, node_id):
+        node_id = (node_id or "").strip()
+        if not node_id.startswith("!") or len(node_id) != 9:
+            raise ValueError("node_id must look like !38f11130")
+        if not self.connected or not self.iface:
+            raise RuntimeError("Not connected")
+        # requestChannels=False matters: channel download is slow and not needed
+        # for normal config/admin operations. Do NOT skip NodeDB entirely — PKI
+        # needs the public-key context already learned by the gateway.
+        return self.iface.getNode(node_id, requestChannels=False, timeout=REMOTE_ADMIN_TIMEOUT_SECS)
+
+    def _section_descriptor(self, node, kind, section):
+        if kind == "config":
+            if section not in CONFIG_SECTIONS:
+                raise ValueError("unknown config section")
+            return node.localConfig.DESCRIPTOR.fields_by_name.get(section)
+        if kind == "module_config":
+            if section not in MODULE_SECTIONS:
+                raise ValueError("unknown module_config section")
+            descriptor = node.moduleConfig.DESCRIPTOR.fields_by_name.get(section)
+            if descriptor is None:
+                raise ValueError(f"module_config.{section} is not available in this CLI/protobuf build")
+            return descriptor
+        raise ValueError("kind must be config or module_config")
+
+    def _section_message(self, node, kind, section):
+        return getattr(node.localConfig if kind == "config" else node.moduleConfig, section)
+
+    def _remote_redact(self, kind, section, values):
+        if kind == "config":
+            return _redact_section(section, values, REMOTE_SECRET_CONFIG_FIELDS)
+        return _redact_section(section, values, REMOTE_SECRET_MODULE_FIELDS)
+
+    def remote_admin_get(self, node_id, kind, section):
+        with self.lock:
+            node = self._remote_node(node_id)
+            descriptor = self._section_descriptor(node, kind, section)
+            node.requestConfig(descriptor)
+            msg = self._section_message(node, kind, section)
+            values = MessageToDict(
+                msg,
+                preserving_proto_field_name=True,
+                always_print_fields_with_no_presence=True,
+            )
+            values = self._remote_redact(kind, section, values)
+            self._log_remote_admin(node_id, f"get {kind}.{section}", "ok")
+            return {"node_id": node_id, "kind": kind, "section": section, "values": values}
+
+    def remote_admin_set(self, node_id, kind, section, values):
+        if not isinstance(values, dict):
+            raise ValueError("values must be a JSON object")
+        with self.lock:
+            node = self._remote_node(node_id)
+            descriptor = self._section_descriptor(node, kind, section)
+            # Read first, then merge. This prevents a partial form/JSON payload
+            # from clearing fields we didn't render, same guard as local config.
+            node.requestConfig(descriptor)
+            if kind == "config":
+                values = _strip_redacted(section, values, REMOTE_SECRET_CONFIG_FIELDS)
+            else:
+                values = _strip_redacted(section, values, REMOTE_SECRET_MODULE_FIELDS)
+            msg = self._section_message(node, kind, section)
+            ParseDict(values, msg, ignore_unknown_fields=True)
+            node.writeConfig(section)
+            self.iface.waitForAckNak()
+            self._log_remote_admin(node_id, f"set {kind}.{section}", "ok", sorted(values.keys()))
+            return {"node_id": node_id, "kind": kind, "section": section, "changed": sorted(values.keys())}
+
+    def remote_admin_action(self, node_id, action, **kwargs):
+        allowed = {
+            "metadata", "reboot", "shutdown", "reset_nodedb",
+            "factory_reset_config", "factory_reset_full",
+        }
+        if action not in allowed:
+            raise ValueError("unknown remote admin action")
+        with self.lock:
+            node = self._remote_node(node_id)
+            if action == "metadata":
+                node.getMetadata()
+            elif action == "reboot":
+                node.reboot(int(kwargs.get("secs") or 10))
+                self.iface.waitForAckNak()
+            elif action == "shutdown":
+                node.shutdown(int(kwargs.get("secs") or 10))
+                self.iface.waitForAckNak()
+            elif action == "reset_nodedb":
+                node.resetNodeDb()
+                self.iface.waitForAckNak()
+            elif action == "factory_reset_config":
+                node.factoryReset(full=False)
+                self.iface.waitForAckNak()
+            elif action == "factory_reset_full":
+                node.factoryReset(full=True)
+                self.iface.waitForAckNak()
+            self._log_remote_admin(node_id, action, "ok")
+            return {"node_id": node_id, "action": action, "ok": True}
 
     def set_config_section(self, section, values):
         with self.lock:
@@ -720,31 +1051,63 @@ class MeshClient:
             ch.index = index
             node.writeChannel(index)
 
-    def send_text(self, text, channel_index=0, destination=None):
+    @staticmethod
+    def _emoji_codepoint(emoji: str) -> int:
+        """Return the first real Unicode codepoint for Meshtastic Data.emoji."""
+        for ch in (emoji or ""):
+            # Skip variation selectors Telegram includes on things like ❤️.
+            if ord(ch) not in (0xFE0E, 0xFE0F):
+                return ord(ch)
+        raise ValueError("empty emoji")
+
+    def send_reaction(self, target_pkt_id, emoji, channel_index=0, destination=None, from_id="me"):
+        """Send a Meshtastic tapback/reaction to an existing packet id."""
+        codepoint = self._emoji_codepoint(emoji)
+        with self.lock:
+            if not self.connected or not self.iface:
+                raise RuntimeError("Not connected")
+            mesh_packet = mesh_pb2.MeshPacket()
+            mesh_packet.channel = channel_index
+            mesh_packet.decoded.portnum = portnums_pb2.PortNum.REPLY_APP
+            mesh_packet.decoded.reply_id = int(target_pkt_id)
+            mesh_packet.decoded.emoji = codepoint
+            mesh_packet.id = self.iface._generatePacketId()
+            mesh_packet.priority = mesh_pb2.MeshPacket.Priority.RELIABLE
+            self.iface._sendPacket(
+                mesh_packet,
+                destinationId=destination or BROADCAST_ADDR,
+                wantAck=False,
+            )
+        self._record_reaction(target_pkt_id, from_id, chr(codepoint))
+
+    def send_text(self, text, channel_index=0, destination=None, want_ack=True):
         """destination is a node id like '!19da16f5'; None means broadcast.
 
-        Both directs and broadcasts now go out with wantAck. A direct message
-        has one recipient, so its ack is the whole story. A broadcast has no
-        single recipient — instead, every node that hears it and rebroadcasts
-        (hop_limit > 0) sends its own implicit ack back to us, from its own
-        node id rather than the broadcast address. That's the only way to
-        answer "did anyone hear this Ch0 transmission," so the extra airtime
-        the ack request costs is worth it.
+        want_ack=True (default for UI/DMs): hop-layer *routing* acks only.
+        - DM: dest (or a relay) may send a ROUTING_APP ack with our requestId.
+        - Broadcast: only nodes that *rebroadcast* tend to emit those acks.
+          CLIENT_MUTE / phone / pure-receiver nodes can show the text and still
+          produce zero acks. So "delivered" on a broadcast means "at least one
+          rebroadcasting node hop-acked," NOT "every listener got the text."
 
-        sendData is used rather than sendText purely because sendText doesn't
-        forward onResponseAckPermitted, and without that the library only
-        delivers NAKs to the callback and swallows the successful acks.
+        Ack matching is done in `_on_routing` via pubsub (every ROUTING packet),
+        not MeshInterface.onResponse — the library pops its response handler on
+        the first ACK/NAK, which permanently dropped later relay acks whenever
+        a local MAX_RETRANSMIT arrived first (the main "nobody heard it" bug).
+
+        want_ack=False: fire-and-forget (beacons / injectors). Status "sent"
+        immediately; no retransmit thrash, no false hop-layer failures.
         """
         with self.lock:
             if not self.connected or not self.iface:
                 raise RuntimeError("Not connected")
+            # No onResponse — see docstring. wantAck still set so the radio
+            # actually requests hop acks; we collect them on pubsub routing.
             packet = self.iface.sendData(
                 text.encode("utf-8"),
                 destinationId=destination or BROADCAST_ADDR,
                 portNum=portnums_pb2.PortNum.TEXT_MESSAGE_APP,
-                wantAck=True,
-                onResponse=self._on_ack_nak,
-                onResponseAckPermitted=True,
+                wantAck=bool(want_ack),
                 channelIndex=channel_index,
             )
         self._record({
@@ -756,26 +1119,63 @@ class MeshClient:
             "channel": channel_index,
             "via_mqtt": False,
             "text": text,
-            "status": "sending",
+            "status": "sending" if want_ack else "sent",
             "status_reason": None,
             "heard_by": [],
         })
 
-    def _on_ack_nak(self, packet):
-        """Delivery result for a message we sent, direct or broadcast.
+    def request_position(self, destination, channel_index=0):
+        """Ask a node to send us its position now, over a specific channel.
 
-        A direct message has one recipient, so its first ack is the whole
-        story. A broadcast's acks accumulate — a different node can report in
-        every time it relays the packet, sometimes seconds apart — so this
-        only ever adds to heard_by, never overwrites it, and a message can
-        keep gaining acks after it first shows "delivered."
+        This is not just "don't wait for the next beacon". A node answers a
+        request using the precision of the channel the request ARRIVED on —
+        `handleReceivedProtobuf` sets the module's precision from the request
+        packet's channel, and `allocReply` reuses it — while its routine
+        beacon uses the first channel with non-zero precision, which for us is
+        always the public one. So asking over an encrypted fleet channel set
+        to 32 bits gets an exact fix back without the public channel ever
+        carrying anything but the fuzzed position.
+
+        The firmware throttles itself to one position reply per 3 minutes, so
+        polling faster than that just burns airtime for nothing.
+
+        Deliberately NOT iface.sendPosition(): that calls waitForPosition()
+        when wantResponse is set, which would block the caller — and here it
+        would do so while holding the client lock, stalling every other packet
+        the client handles. The reply arrives as an ordinary position packet
+        and gets picked up by _on_position like any other.
+        """
+        if not destination:
+            raise ValueError("destination node id required")
+        with self.lock:
+            if not self.connected or not self.iface:
+                raise RuntimeError("Not connected")
+            return self.iface.sendData(
+                mesh_pb2.Position(),
+                destinationId=destination,
+                portNum=portnums_pb2.PortNum.POSITION_APP,
+                wantAck=False,
+                wantResponse=True,
+                channelIndex=channel_index,
+            )
+
+    def _on_routing(self, packet, interface=None):
+        """Handle every ROUTING_APP packet (ACK/NAK) related to our sends.
+
+        Pubsub topic: meshtastic.receive.routing. Unlike MeshInterface's
+        onResponse (one-shot, handler popped after first packet), this sees
+        *every* hop-layer result for a requestId — so broadcast hearers can
+        accumulate and a late relay ack can still upgrade status after an
+        early local MAX_RETRANSMIT.
         """
         try:
-            decoded = packet.get("decoded", {})
+            decoded = packet.get("decoded") or {}
             request_id = decoded.get("requestId")
-            reason = decoded.get("routing", {}).get("errorReason", "NONE")
-            # Same dict.get() footgun fixed in _on_receive_text: "fromId" can
-            # be present but None, which silently defeats a .get(k, default).
+            if request_id is None:
+                return
+            routing = decoded.get("routing") or {}
+            reason = routing.get("errorReason", "NONE")
+            # dict.get footgun: fromId can be present but None
             heard_from = packet.get("fromId") or None
             if not heard_from:
                 num = packet.get("from")
@@ -783,29 +1183,193 @@ class MeshClient:
             via_mqtt = bool(packet.get("viaMqtt"))
         except (AttributeError, TypeError):
             return
-        if request_id is None or heard_from is None:
-            return
-        if reason != "NONE":
-            self._set_message_status(request_id, "failed", reason)
-            return
-        self._add_heard(request_id, heard_from, via_mqtt)
 
-    def _add_heard(self, msg_id, node_id, via_mqtt=False):
+        msg = self._find_outbound(request_id)
+        if msg is None:
+            return  # not one of ours (or already rotated out of the deque)
+
+        if reason == "NONE" or reason is None or reason == "":
+            # Broadcast "implicit ACK" (firmware FloodingRouter): when anyone
+            # rebroadcasts our flood packet, the radio synthesizes a local
+            # ROUTING packet to the app with from=self (see slog:
+            # "Rx someone rebroadcasting for us" → fr=local, Portnum=ROUTING).
+            # Skipping those as "self-acks" was the main reason Ch0 always
+            # showed no relay ack while DMs to Tower delivered fine.
+            is_self = False
+            if self.iface and self.iface.myInfo and heard_from:
+                my_str = f"!{self.iface.myInfo.my_node_num:08x}"
+                is_self = heard_from == my_str
+
+            if is_self:
+                if msg.get("direct"):
+                    logger.debug("Skipping DM self-ack for %s", request_id)
+                    return
+                # Prefer relay_node when firmware stamps the rebroadcaster.
+                relay = packet.get("relayNode") or packet.get("relay_node")
+                if relay:
+                    try:
+                        heard_from = f"!{int(relay):08x}" if int(relay) > 255 else f"!relay:{int(relay):02x}"
+                    except (TypeError, ValueError):
+                        heard_from = "(mesh rebroadcast)"
+                else:
+                    heard_from = "(mesh rebroadcast)"
+                self._add_heard(
+                    request_id, heard_from, via_mqtt, implicit_broadcast=True
+                )
+                return
+
+            if heard_from is None:
+                return
+            self._add_heard(request_id, heard_from, via_mqtt)
+            return
+
+        # --- NAK path ---
+        # Never downgrade a real delivery (late NAK after third-party acks).
+        if msg.get("status") == "delivered":
+            logger.debug("Ignoring %s on already-delivered msg %s", reason, request_id)
+            return
+        # Already has hearers on a broadcast — keep the positive status.
+        if not msg.get("direct") and msg.get("heard_by"):
+            logger.debug(
+                "Ignoring %s on broadcast %s that already has hearers",
+                reason, request_id,
+            )
+            return
+
+        # MAX_RETRANSMIT = local hop-layer retries exhausted. For broadcasts
+        # this is almost always a false "failure" (receivers without
+        # rebroadcast never hop-ack). For DMs it often means the dest never
+        # confirmed — but a late dest ack can still arrive, so do not freeze
+        # the status at failed; leave "sending" for the soft timeout (or a
+        # later success via _add_heard).
+        if reason == "MAX_RETRANSMIT":
+            logger.info(
+                "Hop MAX_RETRANSMIT for %s %s — not marking failed "
+                "(waiting for relay/dest ack or timeout)",
+                "DM" if msg.get("direct") else "broadcast",
+                request_id,
+            )
+            return
+
+        # Hard routing errors (NO_CHANNEL, NO_ROUTE, PKI, …) — real failures.
+        self._set_message_status(request_id, "failed", reason)
+
+    def _find_outbound(self, msg_id):
+        """Return our outbound message dict for pkt id, or None."""
+        for m in reversed(self.messages):
+            if m.get("id") == msg_id and m.get("from") == "me":
+                return m
+        return None
+
+    # Back-compat alias if anything still references the old name
+    def _on_ack_nak(self, packet):
+        self._on_routing(packet)
+
+    def _add_heard(self, msg_id, node_id, via_mqtt=False, *, implicit_broadcast=False):
         for m in reversed(self.messages):
             if m.get("id") == msg_id:
+                # Skip genuine self-acks on DMs ("I transmitted it").
+                # Do NOT skip broadcast implicit ACKs — those arrive as from=self
+                # by design (see _on_routing).
+                if not implicit_broadcast and node_id and self.iface and self.iface.myInfo:
+                    my_num = self.iface.myInfo.my_node_num
+                    my_str = f"!{my_num:08x}" if my_num else None
+                    if my_str and node_id == my_str:
+                        logger.debug("Skipping self-ack from %s", node_id)
+                        return
                 heard = m.setdefault("heard_by", [])
+                is_dest = bool(m.get("direct") and m.get("to") == node_id)
                 if not any(h.get("id") == node_id for h in heard):
-                    heard.append({"id": node_id, "via_mqtt": via_mqtt})
-                m["status"] = "delivered"
-                m["status_reason"] = None
-                logger.info("Message %s heard by %s via %s (%d total)",
-                            msg_id, node_id, "MQTT" if via_mqtt else "RF", len(heard))
+                    entry = {
+                        "id": node_id,
+                        "via_mqtt": via_mqtt,
+                        "is_destination": is_dest,
+                    }
+                    if implicit_broadcast:
+                        entry["implicit"] = True
+                    heard.append(entry)
+
+                # Status logic: for DMs, only "delivered" when the actual
+                # destination acks.  Relay hops show "relayed" to distinguish
+                # "message is moving through the mesh" from "dest got it."
+                if is_dest:
+                    m["status"] = "delivered"
+                    m["status_reason"] = None
+                elif m.get("direct") and m["status"] != "delivered":
+                    m["status"] = "relayed"
+                    m["status_reason"] = None
+                else:
+                    # Broadcast — hop-layer / implicit rebroadcast ack.
+                    # Not proof that every listener (CLIENT_MUTE / phones) got it.
+                    m["status"] = "delivered"
+                    m["status_reason"] = None
+                m["updated_ts"] = time.time()
+
+                logger.info(
+                    "Message %s heard by %s via %s%s%s (%d total)",
+                    msg_id, node_id, "MQTT" if via_mqtt else "RF",
+                    " (destination)" if is_dest else "",
+                    " (implicit rebroadcast)" if implicit_broadcast else "",
+                    len(heard),
+                )
                 if self.store is not None:
                     try:
-                        self.store.update_status(msg_id, "delivered", None, heard_by=heard)
+                        self.store.update_status(msg_id, m["status"], None, heard_by=heard)
                     except Exception as e:
                         logger.warning("Could not persist heard_by: %s", e)
+
                 break
+
+    def _record_reaction(self, msg_id, from_id, emoji):
+        if msg_id is None or not from_id or not emoji:
+            return
+        reactions = None
+        for m in reversed(self.messages):
+            if m.get("id") == msg_id:
+                reactions = [r for r in (m.get("reactions") or []) if r.get("from") != from_id]
+                reactions.append({"from": from_id, "emoji": emoji, "ts": time.time()})
+                m["reactions"] = reactions
+                m["updated_ts"] = time.time()
+                break
+        if self.store is not None:
+            try:
+                reactions = self.store.record_reaction(msg_id, from_id, emoji)
+            except Exception as e:
+                logger.warning("Could not persist reaction: %s", e)
+
+    @staticmethod
+    def _rf_meta_from_packet(packet):
+        """Extract last-hop RF quality + hop count from a meshtastic packet dict.
+
+        hops_away = hopStart - hopLimit (same formula as position_history).
+        relay_node is the last forwarder when present (num or !hex), not a full path.
+        """
+        snr = packet.get("rxSnr")
+        rssi = packet.get("rxRssi")
+        hop_start = packet.get("hopStart")
+        hop_limit = packet.get("hopLimit")
+        hops = None
+        if hop_start is not None and hop_limit is not None:
+            try:
+                hops = max(0, int(hop_start) - int(hop_limit))
+            except (TypeError, ValueError):
+                hops = None
+        relay = packet.get("relayNode")
+        relay_id = None
+        if relay is not None and relay != 0 and relay != "":
+            if isinstance(relay, str) and relay.startswith("!"):
+                relay_id = relay
+            else:
+                try:
+                    relay_id = f"!{int(relay):08x}"
+                except (TypeError, ValueError):
+                    relay_id = str(relay)
+        return {
+            "snr": snr,
+            "rssi": rssi,
+            "hops_away": hops,
+            "relay_node": relay_id,
+        }
 
     def _record(self, msg):
         """Single funnel for every message in or out — keeps the in-memory
@@ -822,6 +1386,7 @@ class MeshClient:
             if m.get("id") == msg_id:
                 m["status"] = status
                 m["status_reason"] = reason
+                m["updated_ts"] = time.time()
                 logger.info("Message %s -> %s%s", msg_id, status,
                             f" ({reason})" if reason else "")
                 break
@@ -838,6 +1403,13 @@ class MeshClient:
         for m in self.messages:
             if m.get("status") == "sending" and now - m["ts"] > MESSAGE_ACK_TIMEOUT_SECS:
                 m["status"] = "no_ack"
+                m["status_reason"] = m.get("status_reason") or "ack timeout"
+                m["updated_ts"] = now
+                if self.store is not None and m.get("id") is not None:
+                    try:
+                        self.store.update_status(m.get("id"), "no_ack", m.get("status_reason"), heard_by=m.get("heard_by") or [])
+                    except Exception as e:
+                        logger.warning("Could not persist expired pending ack: %s", e)
 
     def get_messages(self):
         return list(self.messages)
