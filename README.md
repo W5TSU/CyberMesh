@@ -48,6 +48,24 @@ sudo systemctl enable --now cybermesh
 
 Put it behind a reverse proxy (Caddy, nginx, etc.) if you want TLS or a friendly hostname — CyberMesh itself speaks plain HTTP and has **no authentication of its own**, so don't expose it directly to the internet. A VPN (Tailscale, WireGuard) or a proxy with its own auth layer in front is the intended setup.
 
+## Map tiles (CARTO API key)
+
+The map uses CARTO's raster basemaps. Since 2026 CARTO stamps an
+"API KEY REQUIRED" watermark across unkeyed tiles, so **you need your own free
+key** — this project does not ship one, and keys are not transferable.
+
+Request one at <https://carto.com/basemaps/apikey> (email + domain, no account,
+arrives by email in a few minutes). The free tier is 5M tile requests a month.
+Then set it in your `.env`:
+
+```
+CARTO_KEY=cb1_your_key_here
+```
+
+Leave it blank and the map still draws, just watermarked. CARTO and
+OpenStreetMap attribution must stay visible on the map either way:
+<https://carto.com/attributions>
+
 ## Architecture
 
 - `app.py` — Flask app (routes, API)

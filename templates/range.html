@@ -134,7 +134,13 @@ function snrColor(snr) {
 
 function initRangeMap() {
   rmap = L.map('range-map', {attributionControl: false}).setView([35.6, -97.54], 11);
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+  // CARTO watermarks unkeyed tiles with "API KEY REQUIRED". Get your own free
+  // key at https://carto.com/basemaps/apikey and set CARTO_KEY in .env; blank
+  // keeps the unkeyed URL so the map still draws.
+  const _cartoKey = "{{ carto_key }}";
+  const _cartoUrl = 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png' +
+    (_cartoKey ? '?key=' + encodeURIComponent(_cartoKey) : '');
+  L.tileLayer(_cartoUrl, {
     maxZoom: 19, attribution: '&copy; OpenStreetMap &copy; CARTO'
   }).addTo(rmap);
 }

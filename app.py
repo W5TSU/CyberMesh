@@ -12,6 +12,10 @@ from store import DEFAULT_PATH as DEFAULT_DB_PATH, MessageStore, NodeStore
 
 load_dotenv()
 
+# CARTO basemap key — blank falls back to unkeyed tiles (watermarked).
+# Get your own free key: https://carto.com/basemaps/apikey
+CARTO_KEY = os.getenv("CARTO_KEY", "")
+
 logging.basicConfig(level=logging.INFO)
 
 HOST = os.environ.get("MESHTASTIC_HOST", "192.168.1.100")
@@ -130,6 +134,12 @@ MODULE_SECTIONS = [
     "telemetry", "canned_message", "audio", "remote_hardware", "neighbor_info",
     "detection_sensor", "ambient_lighting", "paxcounter", "traffic_management",
 ]
+
+
+@app.context_processor
+def _inject_carto_key():
+    """Every map template builds its tile URL from this."""
+    return {"carto_key": CARTO_KEY}
 
 
 @app.route("/service-worker.js")
