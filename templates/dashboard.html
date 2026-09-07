@@ -187,6 +187,7 @@
       <option value="32">full precision only</option>
     </select>
     <label class="muted" title="MQTT-delivered positions came in over the internet, not the radio — they say nothing about RF coverage."><input type="checkbox" id="trail-rf-only" checked style="vertical-align:middle;"> RF only</label>
+    <label class="muted" title="Swap the dark CARTO basemap for standard OpenStreetMap tiles (no API key needed)."><input type="checkbox" id="basemap-osm" style="vertical-align:middle;"> OpenStreetMap</label>
     <span class="muted" id="trail-summary" style="margin-left:auto;"></span>
   </div>
   <div id="map"></div>
@@ -408,6 +409,7 @@ function isSymbol(shortName) {
 }
 
 let map = null;
+let cartoLayer = null, osmLayer = null;
 const markers = {};
 let LAST_NODES = [];
 let NODE_META = {};       // node_id -> {favorite, notes, updated_ts}
@@ -485,10 +487,27 @@ function initMap() {
   const _cartoKey = "{{ carto_key }}";
   const _cartoUrl = 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png' +
     (_cartoKey ? '?key=' + encodeURIComponent(_cartoKey) : '');
-  L.tileLayer(_cartoUrl, {
+  cartoLayer = L.tileLayer(_cartoUrl, {
     maxZoom: 19,
     attribution: '&copy; OpenStreetMap &copy; CARTO'
-  }).addTo(map);
+  });
+  // Standard OSM tiles: no API key, but light-themed so they clash with the
+  // dark UI — opt-in via the "OpenStreetMap" checkbox on the Map panel.
+  osmLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; OpenStreetMap contributors'
+  });
+  setBasemap(document.getElementById('basemap-osm').checked);
+}
+
+// Swap the active base layer without disturbing the marker/trail overlays.
+function setBasemap(useOsm) {
+  if (!map) return;
+  const add = useOsm ? osmLayer : cartoLayer;
+  const remove = useOsm ? cartoLayer : osmLayer;
+  if (map.hasLayer(remove)) map.removeLayer(remove);
+  if (!map.hasLayer(add)) add.addTo(map);
+  add.bringToBack();
 }
 
 function nodeIcon(n, isSelf) {
@@ -811,6 +830,7 @@ function savePrefs() {
       search: document.getElementById('node-search').value,
       sortKey: SORT.key,
       sortDir: SORT.dir,
+      osmBasemap: document.getElementById('basemap-osm').checked,
     }));
   } catch (e) {}
 }
@@ -823,6 +843,7 @@ if (PREFS.nopos !== undefined) document.getElementById('show-nopos').checked = P
 if (PREFS.favOnly !== undefined) document.getElementById('fav-only').checked = PREFS.favOnly;
 if (PREFS.heard !== undefined) document.getElementById('heard-filter').value = PREFS.heard;
 if (PREFS.search !== undefined) document.getElementById('node-search').value = PREFS.search;
+if (PREFS.osmBasemap !== undefined) document.getElementById('basemap-osm').checked = PREFS.osmBasemap;
 
 const SORT_KEYS = {
   fav:     n => (isFavorite(n) ? 1 : null),
@@ -882,6 +903,10 @@ document.getElementById('dist-filter').addEventListener('change', refilter);
 document.getElementById('show-nopos').addEventListener('change', refilter);
 document.getElementById('fav-only').addEventListener('change', refilter);
 document.getElementById('heard-filter').addEventListener('change', refilter);
+document.getElementById('basemap-osm').addEventListener('change', e => {
+  setBasemap(e.target.checked);
+  savePrefs();
+});
 // Search doesn't re-fit the map on every keystroke — that would make the map
 // jump around while typing. The other filters change less often, so a re-fit
 // there is a feature, not noise.
