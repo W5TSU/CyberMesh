@@ -1,0 +1,321 @@
+{% extends "base.html" %}
+{% block title %} — Topology{% endblock %}
+{% block head %}
+<script src="/static/d3/d3.min.js"></script>
+<style>
+  :root { --bad: #ff3366; --node: #1b2733; }
+  .topo-row { display: flex; gap: 0.8rem; flex-wrap: wrap; align-items: center; margin-bottom: 0.8rem; }
+  .state-pill {
+    font-size: 0.72rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+    padding: 0.18rem 0.55rem; border-radius: 999px; border: 1px solid currentColor;
+  }
+  .state-idle { color: #66707c; }
+  .state-running { color: var(--ok); }
+  .stat-grid { display: flex; gap: 1.6rem; flex-wrap: wrap; margin: 0.4rem 0 0.2rem; }
+  .stat-grid div { min-width: 90px; }
+  .stat-grid .k { font-size: 0.7rem; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); }
+  .stat-grid .v { font-size: 1.35rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .progress { height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; margin-top: 0.6rem; }
+  .progress div { height: 100%; width: 0; background: var(--accent); transition: width .4s; }
+
+  #topo-stage { position: relative; height: min(640px, 75vh); min-height: 380px; border-radius: 10px; overflow: hidden; background: var(--bg); border: 1px solid var(--border); }
+  #topo-graph { width: 100%; height: 100%; display: block; cursor: grab; }
+  #topo-graph:active { cursor: grabbing; }
+  #topo-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; text-align: center; padding: 1rem; color: var(--muted); }
+  #topo-empty[hidden] { display: none; }
+  .link { stroke-linecap: round; transition: opacity .15s; }
+  .node circle { stroke-width: 2; transition: opacity .15s; }
+  .node text { fill: var(--text); font-size: 11px; pointer-events: none; paint-order: stroke; stroke: var(--bg); stroke-width: 3px; }
+  .node text.name { fill: var(--muted); font-size: 9.5px; }
+  .dim { opacity: 0.12; }
+  .topo-tip {
+    position: absolute; pointer-events: none; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px 10px; font-size: 0.78rem; line-height: 1.45; min-width: 180px;
+    box-shadow: 0 6px 20px rgb(0 0 0 / .45); z-index: 2;
+  }
+  .topo-tip b { color: var(--accent); }
+  .topo-tip .row { display: flex; justify-content: space-between; gap: 14px; font-variant-numeric: tabular-nums; }
+  .topo-tip .row span:first-child { color: var(--muted); }
+
+  .legend { display: flex; gap: 0.6rem 1.4rem; flex-wrap: wrap; margin-top: 0.7rem; font-size: 0.8rem; align-items: center; }
+  .legend .item { display: flex; align-items: center; gap: 0.45rem; }
+  .swatch { width: 22px; height: 4px; border-radius: 2px; }
+  .dot { width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--accent); background: var(--node); }
+  .dot.home { border-color: var(--ok); box-shadow: 0 0 0 3px rgb(51 255 153 / .3); }
+  .dot.router { border-style: dashed; }
+  .dot.unreached { border-color: var(--bad); background: transparent; }
+</style>
+{% endblock %}
+{% block content %}
+
+<div class="panel">
+  <h2>Topology sweep</h2>
+  <p class="muted" style="margin-top:0;">
+    Sends a traceroute to every node heard over RF in the chosen window, one at a time, and draws every
+    hop the replies report as a link. Each trace floods the mesh, so the sweep waits at least 30&nbsp;s
+    between requests. With many nodes it takes a while. Nodes this radio hears directly are linked
+    to it from their last packet, with no traceroute needed.
+  </p>
+  <div class="topo-row">
+    <span class="state-pill state-idle" id="sweep-state">idle</span>
+    <label class="muted" for="sweep-hours">Trace nodes heard within</label>
+    <select id="sweep-hours">
+      <option value="1">1 hour</option>
+      <option value="6">6 hours</option>
+      <option value="24" selected>24 hours</option>
+      <option value="72">3 days</option>
+      <option value="">any time</option>
+    </select>
+    <button class="mini" id="sweep-btn" onclick="toggleSweep()">Start sweep</button>
+    <span class="muted" id="sweep-meta" style="margin-left:auto;"></span>
+  </div>
+  <div class="stat-grid">
+    <div><div class="k">Nodes</div><div class="v" id="s-nodes">—</div></div>
+    <div><div class="k">Links</div><div class="v" id="s-links">—</div></div>
+    <div><div class="k">Heard direct</div><div class="v" id="s-direct">—</div></div>
+    <div><div class="k">Not reached</div><div class="v" id="s-unreached">—</div></div>
+    <div><div class="k">Sweep</div><div class="v" id="s-progress">—</div></div>
+  </div>
+  <div class="progress"><div id="sweep-bar"></div></div>
+</div>
+
+<div class="panel">
+  <h2>Network graph</h2>
+  <div class="topo-row">
+    <label class="muted" for="graph-hours">Show links seen within</label>
+    <select id="graph-hours">
+      <option value="6">6 hours</option>
+      <option value="24">24 hours</option>
+      <option value="72">3 days</option>
+      <option value="168" selected>7 days</option>
+      <option value="">all history</option>
+    </select>
+    <span class="muted" style="margin-left:auto;">Hover a node to highlight its links. Drag to rearrange, scroll to zoom.</span>
+  </div>
+  <div id="topo-stage">
+    <svg id="topo-graph" role="img" aria-label="Network graph of mesh nodes and the radio links between them"></svg>
+    <div id="topo-empty" hidden>No traceroutes yet. Start a sweep to map the mesh.</div>
+    <div class="topo-tip" id="topo-tip" hidden></div>
+  </div>
+  <div class="legend">
+    <span class="item"><span class="swatch" style="background:var(--ok)"></span>SNR &ge; 5 dB</span>
+    <span class="item"><span class="swatch" style="background:var(--warn)"></span>&minus;5 to 5 dB</span>
+    <span class="item"><span class="swatch" style="background:var(--bad)"></span>&lt; &minus;5 dB (dashed)</span>
+    <span class="item"><span class="swatch" style="background:#8899aa"></span>SNR unknown</span>
+    <span class="item"><span class="dot home"></span>This radio</span>
+    <span class="item"><span class="dot router"></span>Router / repeater</span>
+    <span class="item"><span class="dot"></span>Client</span>
+    <span class="item"><span class="dot unreached"></span>Trace failed</span>
+    <span class="muted">Bubble size = number of links. Line thickness = SNR.</span>
+  </div>
+</div>
+
+<script>
+let SWEEP = {};
+let sim = null;
+
+function esc(s) {
+  return String(s === null || s === undefined ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function fmtAgo(t) {
+  if (!t) return '—';
+  const s = Math.max(0, Date.now() / 1000 - t);
+  if (s < 60) return `${Math.round(s)}s ago`;
+  if (s < 3600) return `${Math.round(s / 60)}m ago`;
+  if (s < 86400) return `${(s / 3600).toFixed(1)}h ago`;
+  return `${(s / 86400).toFixed(1)}d ago`;
+}
+
+function snrColor(snr) {
+  if (snr === null || snr === undefined) return '#8899aa';
+  if (snr >= 5) return '#33ff99';
+  if (snr >= -5) return '#ffcc33';
+  return '#ff3366';
+}
+const snrWidth = snr => snr == null ? 1.5 : Math.max(1, Math.min(5, 1 + (snr + 12) / 6));
+const isRouter = n => /^(ROUTER|REPEATER)/.test(n.role || '');
+
+// ---- graph ---------------------------------------------------------------
+
+const svg = d3.select('#topo-graph');
+const stage = document.getElementById('topo-stage');
+const tip = document.getElementById('topo-tip');
+const g = svg.append('g');
+const linkLayer = g.append('g'), nodeLayer = g.append('g');
+svg.call(d3.zoom().scaleExtent([0.3, 4]).on('zoom', e => g.attr('transform', e.transform)));
+
+function moveTip(e) {
+  const r = stage.getBoundingClientRect();
+  let x = e.clientX - r.left + 14, y = e.clientY - r.top + 14;
+  if (x + tip.offsetWidth > r.width - 8) x = e.clientX - r.left - tip.offsetWidth - 14;
+  if (y + tip.offsetHeight > r.height - 8) y = e.clientY - r.top - tip.offsetHeight - 14;
+  tip.style.left = x + 'px'; tip.style.top = y + 'px';
+}
+const row = (k, v) => `<div class="row"><span>${k}</span><span>${esc(v)}</span></div>`;
+
+function renderGraph(data) {
+  const {width, height} = stage.getBoundingClientRect();
+  svg.attr('viewBox', [0, 0, width, height]);
+  document.getElementById('topo-empty').hidden = data.nodes.length > 1;
+
+  // Keep positions of nodes we already placed so a refresh doesn't reshuffle.
+  const prev = new Map((sim ? sim.nodes() : []).map(n => [n.id, n]));
+  const nodes = data.nodes.map(n => Object.assign(n, prev.has(n.id)
+    ? {x: prev.get(n.id).x, y: prev.get(n.id).y} : {}));
+  const links = data.links.map(l => ({...l}));
+
+  const degree = {};
+  links.forEach(l => { degree[l.source] = (degree[l.source] || 0) + 1; degree[l.target] = (degree[l.target] || 0) + 1; });
+  const radius = n => 9 + Math.min(degree[n.id] || 0, 12) * 2.6 + (n.is_me ? 4 : 0);
+  const adj = new Set(links.flatMap(l => [l.source + '|' + l.target, l.target + '|' + l.source]));
+
+  const link = linkLayer.selectAll('line').data(links, l => l.source + '|' + l.target).join('line')
+    .attr('class', 'link')
+    .attr('stroke', l => snrColor(l.snr))
+    .attr('stroke-width', l => snrWidth(l.snr))
+    .attr('stroke-opacity', 0.75)
+    .attr('stroke-dasharray', l => l.snr != null && l.snr < -5 ? '4 4' : null);
+  link.selectAll('title').data(l => [l]).join('title')
+    .text(l => `SNR ${l.snr == null ? '?' : l.snr.toFixed(2) + ' dB'} · ${l.kinds.join(' + ')} · ${fmtAgo(l.ts)}`);
+
+  const node = nodeLayer.selectAll('g.node').data(nodes, n => n.id).join(enter => {
+    const e = enter.append('g').attr('class', 'node');
+    e.append('circle');
+    e.append('text').attr('class', 'short').attr('text-anchor', 'middle').attr('dy', '0.35em').style('font-weight', 600);
+    e.append('text').attr('class', 'name').attr('text-anchor', 'middle');
+    return e;
+  });
+  const unreached = n => n.trace === 'failed' && !degree[n.id];
+  node.select('circle')
+    .attr('r', radius)
+    .attr('fill', n => unreached(n) ? 'transparent' : 'var(--node)')
+    .attr('stroke', n => n.is_me ? '#33ff99' : unreached(n) ? '#ff3366' : '#33e0ff')
+    .attr('stroke-dasharray', n => isRouter(n) ? '4 3' : null)
+    .attr('filter', n => n.is_me ? 'drop-shadow(0 0 6px rgb(51 255 153 / .6))' : null);
+  node.select('text.short').text(n => n.short);
+  node.select('text.name').attr('dy', n => radius(n) + 13).text(n => n.name);
+
+  node.on('pointerenter', (e, n) => {
+    const own = links.filter(l => l.source.id === n.id || l.target.id === n.id);
+    const best = d3.max(own, l => l.snr);
+    tip.innerHTML = `<b>${esc(n.name)}</b> <span class="muted">${esc(n.id)}</span>` +
+      (n.hw ? row('Hardware', n.hw) : '') +
+      (n.role ? row('Role', n.role) : '') +
+      (n.battery != null ? row('Battery', n.battery > 100 ? 'Powered' : n.battery + '%') : '') +
+      (n.hops_away != null ? row('Hops away', n.hops_away) : '') +
+      row('Last heard', fmtAgo(n.last_heard)) +
+      row('Links', own.length) +
+      (best != null ? row('Best SNR', best.toFixed(2) + ' dB') : '') +
+      row('Traceroute', n.is_me ? 'this radio' : (n.trace || 'not traced'));
+    tip.hidden = false;
+    moveTip(e);
+    node.classed('dim', m => m.id !== n.id && !adj.has(n.id + '|' + m.id));
+    link.classed('dim', l => l.source.id !== n.id && l.target.id !== n.id);
+  }).on('pointermove', moveTip).on('pointerleave', () => {
+    tip.hidden = true;
+    node.classed('dim', false); link.classed('dim', false);
+  });
+
+  node.call(d3.drag()
+    .on('start', (e, n) => { if (!e.active) sim.alphaTarget(0.3).restart(); n.fx = n.x; n.fy = n.y; })
+    .on('drag', (e, n) => { n.fx = e.x; n.fy = e.y; })
+    .on('end', (e, n) => { if (!e.active) sim.alphaTarget(0); n.fx = null; n.fy = null; }));
+
+  if (sim) sim.stop();
+  sim = d3.forceSimulation(nodes)
+    .force('link', d3.forceLink(links).id(n => n.id)
+      .distance(l => 80 + (12 - (l.snr ?? 0)) * 4).strength(0.6))
+    .force('charge', d3.forceManyBody().strength(-520))
+    .force('collide', d3.forceCollide().radius(n => radius(n) + 14))
+    .force('center', d3.forceCenter(width / 2, height / 2))
+    .force('x', d3.forceX(width / 2).strength(0.05))
+    .force('y', d3.forceY(height / 2).strength(0.07))
+    .on('tick', () => {
+      link.attr('x1', l => l.source.x).attr('y1', l => l.source.y)
+          .attr('x2', l => l.target.x).attr('y2', l => l.target.y);
+      node.attr('transform', n => `translate(${n.x},${n.y})`);
+    });
+  // Anchor this radio at the centre so the picture reads outward from home.
+  const me = nodes.find(n => n.is_me);
+  if (me && !prev.has(me.id)) { me.x = width / 2; me.y = height / 2; }
+  if (prev.size) sim.alpha(0.3);
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    sim.stop(); for (let i = 0; i < 300; i++) sim.tick(); sim.on('tick')();
+  }
+
+  const direct = data.links.filter(l => l.kinds.includes('heard')).length;
+  document.getElementById('s-nodes').textContent = data.nodes.length;
+  document.getElementById('s-links').textContent = data.links.length;
+  document.getElementById('s-direct').textContent = direct;
+  document.getElementById('s-unreached').textContent = data.nodes.filter(unreached).length;
+}
+
+// ---- sweep ---------------------------------------------------------------
+
+function renderSweep(s) {
+  SWEEP = s || {};
+  const pill = document.getElementById('sweep-state');
+  pill.textContent = SWEEP.running ? 'sweeping' : 'idle';
+  pill.className = 'state-pill ' + (SWEEP.running ? 'state-running' : 'state-idle');
+  document.getElementById('sweep-btn').textContent = SWEEP.running ? 'Cancel sweep' : 'Start sweep';
+  document.getElementById('sweep-hours').disabled = !!SWEEP.running;
+  document.getElementById('s-progress').textContent =
+    SWEEP.total ? `${SWEEP.done}/${SWEEP.total}` : '—';
+  document.getElementById('sweep-bar').style.width =
+    SWEEP.total ? `${100 * SWEEP.done / SWEEP.total}%` : '0';
+  let meta = '';
+  if (SWEEP.running) {
+    meta = `Tracing ${esc(SWEEP.current ? SWEEP.current.name : '…')} · ${SWEEP.ok} answered, ${SWEEP.failed} no reply`;
+  } else if (SWEEP.finished) {
+    meta = `Last sweep ${SWEEP.cancelled ? 'cancelled' : 'finished'} ${fmtAgo(SWEEP.finished)} · ` +
+      `${SWEEP.ok} answered, ${SWEEP.failed} no reply`;
+  }
+  document.getElementById('sweep-meta').innerHTML = meta;
+}
+
+async function refreshTopology() {
+  const hours = document.getElementById('graph-hours').value;
+  try {
+    const r = await fetch('/api/topology' + (hours ? `?hours=${hours}` : ''));
+    const d = await r.json();
+    const wasRunning = SWEEP.running;
+    renderSweep(d.sweep);
+    renderGraph(d);
+    if (wasRunning && !d.sweep.running) toast('Topology sweep complete');
+  } catch (e) {
+    toast('Could not load topology', true);
+  }
+}
+
+async function toggleSweep() {
+  if (SWEEP.running) {
+    await fetch('/api/topology/cancel', {method: 'POST'});
+    toast('Cancelling after the current trace…');
+    return;
+  }
+  const hours = document.getElementById('sweep-hours').value;
+  const r = await fetch('/api/topology/sweep', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({hours: hours ? Number(hours) : null}),
+  });
+  const d = await r.json();
+  if (!d.ok) { toast('Sweep not started: ' + d.error, true); return; }
+  renderSweep(d.sweep);
+  toast(`Tracing ${d.sweep.total} nodes`);
+}
+
+document.getElementById('graph-hours').addEventListener('change', refreshTopology);
+new ResizeObserver(() => {
+  const {width, height} = stage.getBoundingClientRect();
+  svg.attr('viewBox', [0, 0, width, height]);
+}).observe(stage);
+
+refreshTopology();
+// Poll faster while a sweep is running so new links appear as traces land.
+(function poll() {
+  setTimeout(async () => { await refreshTopology(); poll(); }, SWEEP.running ? 8000 : 30000);
+})();
+</script>
+{% endblock %}
