@@ -9,6 +9,7 @@ Built because most Meshtastic hardware (classic ESP32-based boards like the T-Be
 - **Live node map & list** — position, battery, SNR, hops, last-heard, RF vs. MQTT source, distance/time/favorite filters, sortable columns
 - **Messaging** — broadcast and direct messages, per-channel feeds, delivery status with RF-vs-MQTT ack path breakdown, unread indicators, persisted history that survives restarts
 - **Traceroute** — async (the underlying library's own traceroute call blocks and prints to stdout, which doesn't work in a web app), with saved "proven path" routes per node
+- **Topology map** — a sweep that traceroutes every recently heard RF node, one at a time, and draws the replies as a node-link graph: bubbles sized by link count, links colored and weighted by SNR
 - **Config & channels** — every `LocalConfig`/`ModuleConfig` section and every channel, exposed as generic editable JSON rather than hand-built forms, so it covers the whole device without reimplementing each settings page. Secrets (WiFi PSK, private key, MQTT password, channel PSKs) are masked in the UI.
 - **Channel health** — tracks the node's own self-reported channel utilization and airtime over time, correlated against message ack success rate, so you can see whether delivery failures line up with RF congestion
 - **Admin actions** — reboot / shutdown / factory reset
@@ -70,6 +71,7 @@ OpenStreetMap attribution must stay visible on the map either way:
 
 - `app.py` — Flask app (routes, API)
 - `mesh_client.py` — owns a single background thread holding the persistent connection to the node (auto-reconnect, watchdog, message/telemetry tracking)
+- `topology.py` — the traceroute sweep thread and the graph builder behind the Topology page
 - `store.py` — SQLite persistence (message history, node notes/favorites, saved traceroutes, telemetry history) — all in one file next to the app, no external database needed
 - `templates/` / `static/` — server-rendered pages + the PWA shell
 

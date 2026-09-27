@@ -8,7 +8,8 @@ from flask import Flask, jsonify, render_template, request, send_from_directory
 
 from mesh_client import MeshClient
 from range_probe import create_probe
-from store import DEFAULT_PATH as DEFAULT_DB_PATH, MessageStore, NodeStore
+from store import DEFAULT_PATH as DEFAULT_DB_PATH, TRACEROUTE_HISTORY_LIMIT, MessageStore, NodeStore
+from topology import TopologySweep, build_graph
 
 load_dotenv()
 
@@ -127,6 +128,10 @@ range_probe = create_probe(
     motion_window=_int_env("RANGE_PROBE_MOTION_WINDOW", 900),
     linger_secs=_int_env("RANGE_PROBE_LINGER", 1200),
 )
+
+# Topology sweeps are started by hand from the Topology page; the gap between
+# traceroutes is floored at the firmware's own rate limit.
+topology_sweep = TopologySweep(client, gap_secs=_int_env("TOPOLOGY_GAP_SECS", 30))
 
 CONFIG_SECTIONS = ["device", "position", "power", "network", "display", "lora", "bluetooth", "security"]
 MODULE_SECTIONS = [
@@ -609,6 +614,44 @@ def api_range_probes():
         "status": range_probe.status() if range_probe else None,
         "home": {"lat": RANGE_HOME_LAT, "lon": RANGE_HOME_LON} if RANGE_HOME_LAT and RANGE_HOME_LON else None,
     })
+
+
+@app.route("/topology")
+def topology_page():
+    return render_template("topology.html", active="topology")
+
+
+@app.route("/api/topology")
+def api_topology():
+    hours = request.args.get("hours", type=float)
+    since = (time.time() - hours * 3600) if hours else None
+    my_num = client.my_node_num()
+    graph = build_graph(
+        node_store.recent_traceroutes(TRACEROUTE_HISTORY_LIMIT),
+        client.node_list(),
+        my_id=f"!{my_num:08x}" if my_num is not None else None,
+        since_ts=since,
+    )
+    graph["sweep"] = topology_sweep.status()
+    return jsonify(graph)
+
+
+@app.route("/api/topology/sweep", methods=["POST"])
+def api_topology_sweep():
+    data = request.get_json(force=True, silent=True) or {}
+    if not client.status().get("connected"):
+        return jsonify({"ok": False, "error": "radio not connected"}), 400
+    hours = data.get("hours", 24)
+    started = topology_sweep.start(max_age_hours=float(hours) if hours else None)
+    if not started:
+        return jsonify({"ok": False, "error": "a sweep is already running"}), 409
+    return jsonify({"ok": True, "sweep": topology_sweep.status()})
+
+
+@app.route("/api/topology/cancel", methods=["POST"])
+def api_topology_cancel():
+    topology_sweep.cancel()
+    return jsonify({"ok": True})
 
 
 @app.route("/api/request-position", methods=["POST"])

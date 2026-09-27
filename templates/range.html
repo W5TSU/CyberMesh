@@ -140,9 +140,21 @@ function initRangeMap() {
   const _cartoKey = "{{ carto_key }}";
   const _cartoUrl = 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png' +
     (_cartoKey ? '?key=' + encodeURIComponent(_cartoKey) : '');
-  L.tileLayer(_cartoUrl, {
-    maxZoom: 19, attribution: '&copy; OpenStreetMap &copy; CARTO'
-  }).addTo(rmap);
+  // Follow the dashboard's "OpenStreetMap" basemap toggle, which it saves in
+  // the shared viewprefs.
+  let useOsm = false;
+  try {
+    useOsm = !!(JSON.parse(localStorage.getItem('cybermesh.viewprefs')) || {}).osmBasemap;
+  } catch (e) {}
+  if (useOsm) {
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(rmap);
+  } else {
+    L.tileLayer(_cartoUrl, {
+      maxZoom: 19, attribution: '&copy; OpenStreetMap &copy; CARTO'
+    }).addTo(rmap);
+  }
 }
 
 function probePopup(p) {

@@ -883,8 +883,8 @@ class MeshClient:
             name = (node or {}).get("user", {}).get("longName")
         except Exception:
             name = None
-        # snr is always present (None for the endpoints, which have no
-        # per-hop SNR of their own) so consumers never have to probe for it.
+        # snr is always present (None for the route's origin, which received
+        # nothing) so consumers never have to probe for it.
         return {"id": node_id, "name": name or node_id, "snr": None}
 
     def _hops(self, nums, snrs):
@@ -899,6 +899,12 @@ class MeshClient:
             hop["snr"] = snr
             out.append(hop)
         return out
+
+    @staticmethod
+    def _final_snr(snrs, relays):
+        if snrs and len(snrs) > relays and snrs[relays] != -128:
+            return snrs[relays] / 4
+        return None
 
     def _on_traceroute(self, packet):
         try:
@@ -927,18 +933,26 @@ class MeshClient:
 
         entry = self.traceroutes.get(src) or {"to": src, "ts": time.time()}
         # Route towards the destination, then the path the reply took back.
+        route = ([self._node_label(self.my_node_num() or 0)] +
+                 self._hops(list(rd.route), list(rd.snr_towards)) +
+                 [self._node_label(packet.get("from", 0))])
+        route_back = (
+            [self._node_label(packet.get("from", 0))] +
+            self._hops(list(rd.route_back), list(rd.snr_back)) +
+            [self._node_label(self.my_node_num() or 0)]
+        ) if rd.route_back or rd.snr_back else []
+        # The SNR lists carry one more entry than the relay list: what the
+        # final receiver measured on the last hop. Without it a direct
+        # neighbour's trace has no link quality at all.
+        route[-1]["snr"] = self._final_snr(rd.snr_towards, len(rd.route))
+        if route_back:
+            route_back[-1]["snr"] = self._final_snr(rd.snr_back, len(rd.route_back))
         entry.update(
             status="ok",
             error=None,
             hops_there=len(rd.route),
-            route=[self._node_label(self.my_node_num() or 0)] +
-                  self._hops(list(rd.route), list(rd.snr_towards)) +
-                  [self._node_label(packet.get("from", 0))],
-            route_back=(
-                [self._node_label(packet.get("from", 0))] +
-                self._hops(list(rd.route_back), list(rd.snr_back)) +
-                [self._node_label(self.my_node_num() or 0)]
-            ) if rd.route_back or rd.snr_back else [],
+            route=route,
+            route_back=route_back,
             completed_ts=time.time(),
         )
         self.traceroutes[src] = entry
